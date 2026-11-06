@@ -34,11 +34,12 @@ try:
 	from collections.abc import MutableMapping
 except ImportError:
 	from collections import MutableMapping
+from collections import OrderedDict
 
 from .failregex import mapTag2Opt
 from .ipdns import DNSUtils
 from .mytime import MyTime
-from .utils import Utils
+from .utils import Utils, CommandCancelHandle
 from ..helpers import getLogger, _merge_copy_dicts, \
 	splitwords, substituteRecursiveTags, uni_string, TAG_CRE, MAX_TAG_REPLACE_COUNT
 
@@ -47,6 +48,20 @@ logSys = getLogger(__name__)
 
 # Create a lock for running system commands
 _cmd_lock = threading.Lock()
+
+# Cancellation token of the command currently executed by this thread
+# (the actions thread executes commands synchronously, the observer thread
+# may additionally execute prolong commands):
+_cmd_exec_ctx = threading.local()
+
+
+class ActionCommandCancelled(Exception):
+	"""Raised when an action command was cancelled (stop/reload) while it
+	was still running, instead of completing or failing on its own.
+
+	It is not a command failure - the interrupted ban ticket is rolled
+	back to unfinished state rather than settled as banned.
+	"""
 
 # Specifies whether IPv6 subsystem is available:
 allowed_ipv6 = DNSUtils.IPv6IsAllowed
@@ -347,6 +362,13 @@ class CommandAction(ActionBase):
 		self.__properties = None
 		self.__started = {}
 		self.__substCache = {}
+		## Commands of this action currently in progress (token -> command),
+		## protected against concurrent cancel/prolong from other threads:
+		self.__activeCmds = OrderedDict()
+		self.__activeLock = threading.Lock()
+		## Cumulative cancellation statistics (reported in action status):
+		self._cancelCount = 0
+		self._cancelFailCount = 0
 		self.clearAllParams()
 		self._logSys.debug("Created %s" % self.__class__)
 
@@ -468,7 +490,7 @@ class CommandAction(ActionBase):
 						aInfo['family'] = famoper
 						# replace dynamical tags, important - don't cache, no recursion and auto-escape here
 						realCmd = self.replaceDynamicTags(cmd, aInfo)
-					ret = self.executeCmd(realCmd, self.timeout)
+					ret = self._execCmd(realCmd)
 					res &= ret
 				if afterExec: afterExec(famoper, ret)
 				self._operationExecuted(tag, famoper, cmd if ret else None)
@@ -913,7 +935,7 @@ class CommandAction(ActionBase):
 		if not forceStart and family is not None and family not in self.__started:
 			return 1
 		checkCmd = self._getOperation('<actioncheck>', family)
-		if not checkCmd or self.executeCmd(checkCmd, self.timeout):
+		if not checkCmd or self._execCmd(checkCmd):
 			return 1
 		# if don't need repair/restore - just return:
 		if beforeRepair and not beforeRepair():
@@ -925,7 +947,7 @@ class CommandAction(ActionBase):
 		# try to find repair command, if exists - exec it:
 		repairCmd = self._getOperation('<actionrepair>', family)
 		if repairCmd:
-			if not self.executeCmd(repairCmd, self.timeout):
+			if not self._execCmd(repairCmd):
 				self.__started[family] = 0
 				self._logSys.critical("Unable to restore environment")
 				return 0
@@ -941,7 +963,7 @@ class CommandAction(ActionBase):
 			except RuntimeError: # bypass error in stop (if start/check succeeded hereafter).
 				pass
 			self._start(family, forceStart=forceStart or not self._startOnDemand)
-		if self.__started.get(family) and not self.executeCmd(checkCmd, self.timeout):
+		if self.__started.get(family) and not self._execCmd(checkCmd):
 			self._logSys.critical("Unable to restore environment")
 			return 0
 		return 1
@@ -1004,10 +1026,99 @@ class CommandAction(ActionBase):
 				realCmd = cmd
 
 			# try execute command:
-			ret = self.executeCmd(realCmd, self.timeout)
+			ret = self._execCmd(realCmd)
 			repcnt += 1
 			if ret or repcnt > 1:
 				return ret
+
+	def _execCmd(self, realCmd):
+		"""Executes an operation command with cancellation support.
+
+		Unlike the plain static `executeCmd`, the running command is
+		registered on this action with a cancellation token, so stop or
+		reload can interrupt it without waiting for the full timeout.
+
+		Raises
+		------
+		ActionCommandCancelled
+			If the command was cancelled before completing successfully.
+			A command completing successfully at the same moment as the
+			cancellation is settled once as successful (no exception).
+		"""
+		token = CommandCancelHandle()
+		with self.__activeLock:
+			self.__activeCmds[id(token)] = (token, realCmd)
+		_cmd_exec_ctx.token = token
+		try:
+			ret = self.executeCmd(realCmd, self.timeout)
+		finally:
+			_cmd_exec_ctx.token = None
+			with self.__activeLock:
+				self.__activeCmds.pop(id(token), None)
+		if token.engaged:
+			if not ret:
+				# cancelled before a successful completion - termination
+				# failure only counts when the process could not be reaped:
+				failed = token.outcome == 'terminated' and token.retcode is None
+				self._cancelCount += 1
+				# report to the actions object, whose counters survive the
+				# removal/stop of this action:
+				if self._jail is not None and \
+					hasattr(self._jail.actions, '_noteCancel'):
+					self._jail.actions._noteCancel(failed=failed)
+				if failed:
+					self._cancelFailCount += 1
+					logSys.error(
+						"Action %r cancellation failed at stage %s for %r",
+						self._name, token.failStage or 'SIGTERM', realCmd)
+				else:
+					logSys.info("Action %r command cancelled: %r",
+						self._name, realCmd)
+				raise ActionCommandCancelled(
+					"Action %r command %r was cancelled" % (
+						self._name, realCmd))
+			# cancel and successful completion happened simultaneously -
+			# the completion wins, settle just once:
+			logSys.debug("Action %r command %r completed successfully at "
+				"cancellation, settled as successful", self._name, realCmd)
+		return ret
+
+	def cancel(self):
+		"""Requests cancellation of all commands currently executed by the action.
+
+		This only signals the running commands; the executing thread
+		performs the actual (two-level) process termination, so this call
+		never blocks on process handling. It is idempotent: repeated calls
+		do not terminate processes twice and never raise.
+
+		Returns
+		-------
+		int
+			Number of in-progress commands signalled.
+		"""
+		with self.__activeLock:
+			tokens = [token for token, cmd in self.__activeCmds.values()]
+		n = 0
+		for token in tokens:
+			try:
+				token.cancel()
+				n += 1
+			except Exception as e:
+				self._cancelFailCount += 1
+				if self._jail is not None and \
+					hasattr(self._jail.actions, '_noteCancel'):
+					self._jail.actions._noteCancel(failed=True)
+				logSys.error(
+					"Failed to signal cancellation for action %r at stage "
+					"'signal': %s", self._name, e)
+		return n
+
+	def activeCommands(self):
+		"""Returns the list of commands currently executed by the action.
+		"""
+		with self.__activeLock:
+			return [cmd if isinstance(cmd, str) else cmd[0]
+				for token, cmd in self.__activeCmds.values()]
 
 	@staticmethod
 	def executeCmd(realCmd, timeout=60, **kwargs):
@@ -1038,5 +1149,11 @@ class CommandAction(ActionBase):
 			logSys.debug("Nothing to do")
 			return True
 
+		# attach cancellation token of the command currently executed by
+		# this thread, unless explicitly overridden by the caller:
+		if 'cancel_event' not in kwargs:
+			token = getattr(_cmd_exec_ctx, 'token', None)
+			if token is not None:
+				kwargs['cancel_event'] = token
 		with _cmd_lock:
 			return Utils.executeCmd(realCmd, timeout, shell=True, output=False, **kwargs)

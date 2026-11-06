@@ -472,6 +472,11 @@ class ObserverThread(JailThread):
 		"""
 		if ticket.restored: # pragma: no cover (normally not resored tickets only)
 			return
+		# ban was cancelled (stop/reload) before completion - never persist it:
+		if getattr(ticket, 'cancelled', False):
+			logSys.debug("[%s] Observer: ignore canceled ban %s", jail.name,
+				ticket.getID())
+			return False
 		try:
 			oldbtime = btime
 			ip = ticket.getID()
@@ -501,6 +506,12 @@ class ObserverThread(JailThread):
 				self.add_timer(min(10, max(0, btime - oldbtime - 5)), self.prolongBan, ticket, jail)
 			# add ticket to database, but only if was not restored (not already read from database):
 			if jail.database is not None and not ticket.restored:
+				# re-check cancellation - it may have happened while the
+				# ban time was being calculated (rollback deletes the record):
+				if getattr(ticket, 'cancelled', False):
+					logSys.debug("[%s] Observer: skip persistence of canceled "
+						"ban %s", jail.name, ip)
+					return False
 				# add to database always only after ban time was calculated an not yet already banned:
 				jail.database.addBan(jail, ticket)
 		except Exception as e:

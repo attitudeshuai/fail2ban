@@ -21,6 +21,7 @@ __author__ = "Serg G. Brester (sebres) and Fail2Ban Contributors"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier, 2011-2012 Yaroslav Halchenko, 2012-2015 Serg G. Brester"
 __license__ = "GPL"
 
+import errno
 import fcntl
 import logging
 import os
@@ -28,6 +29,7 @@ import signal
 import subprocess
 import sys
 from	 threading import Lock
+import threading
 import time
 import types
 from ..helpers import getLogger, _merge_dicts, uni_decode
@@ -37,6 +39,61 @@ import importlib.machinery
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
+
+
+class CommandCancelHandle(object):
+	"""Cancellation token shared between a command executor and its caller.
+
+	A running command is cancelled by :meth:`cancel` (just an idempotent
+	event signal - the executing thread performs the actual process
+	termination, so the signal itself never blocks). The executor reports
+	the outcome back on the same handle, so the caller can distinguish
+	cancellations from timeouts and natural completions.
+
+	Attributes
+	----------
+	engaged : bool
+		Set by `Utils.executeCmd` if a cancellation was observed while the
+		command was in progress (before its natural completion).
+	outcome : str or None
+		One of None (not engaged), 'skipped' (cancelled before the process
+		started), 'terminated' (a running process had to be terminated).
+	retcode : int or None
+		Return code of the command after cancellation, if known.
+	failStage : str or None
+		Stage ('SIGTERM', 'SIGKILL', 'reap') at which termination failed,
+		if the process could not be terminated/reaped cleanly.
+	pid : int or None
+		PID of the spawned command process.
+	"""
+
+	__slots__ = ('_event', 'engaged', 'outcome', 'retcode', 'failStage', 'pid')
+
+	def __init__(self):
+		self._event = threading.Event()
+		self.engaged = False
+		self.outcome = None
+		self.retcode = None
+		self.failStage = None
+		self.pid = None
+
+	def cancel(self):
+		"""Request cancellation. Idempotent and never raises."""
+		self._event.set()
+
+	def is_set(self):
+		return self._event.is_set()
+
+
+def _setCancelInfo(cancel_event, **kwargs):
+	# outcome is reported on CommandCancelHandle only (plain events are ignored):
+	if cancel_event is None:
+		return
+	for k, v in kwargs.items():
+		try:
+			setattr(cancel_event, k, v)
+		except (AttributeError, TypeError): # pragma: no cover - plain event passed
+			pass
 
 # Some hints on common abnormal exit codes
 _RETCODE_HINTS = {
@@ -146,8 +203,83 @@ class Utils():
 		return realCmd
 
 	@staticmethod
+	def terminateProcess(popen, term_timeout=DEFAULT_SLEEP_INTERVAL):
+		"""Two-level termination of a running command and its whole process tree.
+
+		The command is spawned in its own session/process group (see
+		`preexec_fn=os.setsid` in `executeCmd`), so signalling the group
+		reaps every process the command spawned, not just the shell.
+
+		1. A gentle SIGTERM is sent to the whole process group; if the
+		   process exits within `term_timeout` seconds nothing else is done.
+		2. If it is still alive, a SIGKILL is sent to the group, followed
+		   by a final wait and an explicit reap (``Popen.wait``), so no
+		   running children and no zombies are left behind.
+
+		Parameters
+		----------
+		popen : subprocess.Popen
+			The process (group leader) to terminate.
+		term_timeout : float
+			Upper bound to wait after SIGTERM (and again after SIGKILL),
+			in seconds. Both termination levels are completed in this call.
+
+		Returns
+		-------
+		(retcode, failStage) : tuple
+			`retcode` is the reaped return code (negative if killed by a
+			signal) or None if the process could neither be terminated nor
+			reaped; `failStage` is the failing stage ('SIGTERM', 'SIGKILL'
+			or 'reap') or None if termination succeeded.
+		"""
+		retcode = popen.poll()
+		if retcode is not None:
+			# already exited (and thus reaped) - nothing to terminate:
+			return retcode, None
+		failStage = None
+		try:
+			pgid = os.getpgid(popen.pid)
+		except OSError:
+			# leader gone (whole group cannot be signalled any longer):
+			return popen.poll(), None
+
+		def _wait_reaped():
+			rc = popen.poll()
+			return (True, rc) if rc is not None else None
+
+		# 1st level - gentle termination of the whole process group:
+		try:
+			os.killpg(pgid, signal.SIGTERM)
+		except OSError as e:
+			if e.errno == errno.ESRCH:
+				return popen.poll(), None
+			failStage = 'SIGTERM'
+		else:
+			waited = Utils.wait_for(_wait_reaped, term_timeout,
+				Utils.DEFAULT_SHORTEST_INTERVAL)
+			if waited:
+				return waited[1], None
+		# 2nd level - forced termination of the still alive process group:
+		try:
+			os.killpg(pgid, signal.SIGKILL)
+		except OSError as e:
+			if e.errno != errno.ESRCH:
+				failStage = failStage or 'SIGKILL'
+		waited = Utils.wait_for(_wait_reaped, term_timeout,
+			Utils.DEFAULT_SHORTEST_INTERVAL)
+		if waited:
+			return waited[1], failStage
+		# final reap, so the direct child never becomes a zombie:
+		try:
+			retcode = popen.wait(timeout=term_timeout)
+		except Exception:
+			failStage = failStage or 'reap'
+			retcode = popen.poll()
+		return retcode, failStage
+
+	@staticmethod
 	def executeCmd(realCmd, timeout=60, shell=True, output=False, tout_kill_tree=True, 
-		success_codes=(0,), varsDict=None):
+		success_codes=(0,), varsDict=None, cancel_event=None):
 		"""Executes a command.
 
 		Parameters
@@ -164,6 +296,12 @@ class Utils():
 			If False, just indication of success is returned
 		varsDict: dict
 			variables supplied to the command (or to the shell script)
+		cancel_event : CommandCancelHandle or threading.Event, optional
+			If set before the command completes (stop/reload), the command
+			is terminated without waiting for the full timeout; a command
+			that completed on its own before/at the same moment is still
+			reported as successful. Timeouts and cancellations are handled
+			separately.
 
 		Returns
 		-------
@@ -188,23 +326,42 @@ class Utils():
 				env = _merge_dicts(os.environ, varsDict)
 		realCmdId = id(realCmd)
 		logCmd = lambda level: logSys.log(level, "%x -- exec: %s", realCmdId, realCmd)
+		# cancellation requested before the command even got a chance to start
+		# (e.g. it was queued behind another command when stop/reload began):
+		if cancel_event is not None and cancel_event.is_set():
+			logSys.info("%x -- canceled before execution", realCmdId)
+			_setCancelInfo(cancel_event, engaged=True, outcome='skipped')
+			return False if not output else (False, stdout, stderr, retcode)
 		try:
 			popen = subprocess.Popen(
 				realCmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=shell, env=env,
 				preexec_fn=os.setsid  # so that killpg does not kill our process
 			)
+			if cancel_event is not None:
+				_setCancelInfo(cancel_event, pid=popen.pid)
 			# wait with timeout for process has terminated:
 			retcode = popen.poll()
+			canceled = False
 			if retcode is None:
 				def _popen_wait_end():
+					# natural completion is checked before cancellation so a
+					# command finishing at the same moment is settled once as
+					# successful (never terminated twice):
 					retcode = popen.poll()
-					return (True, retcode) if retcode is not None else None
+					if retcode is not None:
+						return ('exit', retcode)
+					if cancel_event is not None and cancel_event.is_set():
+						return ('cancel', None)
+					return None
 				# popen.poll is fast operation so we can use the shortest sleep interval:
-				retcode = Utils.wait_for(_popen_wait_end, timeout, Utils.DEFAULT_SHORTEST_INTERVAL)
-				if retcode:
-					retcode = retcode[1]
-			# if timeout:
-			if retcode is None:
+				waited = Utils.wait_for(_popen_wait_end, timeout, Utils.DEFAULT_SHORTEST_INTERVAL)
+				if waited is not None:
+					if waited[0] == 'exit':
+						retcode = waited[1]
+					else:
+						canceled = True
+			# if timeout (cancellation is handled separately below):
+			if retcode is None and not canceled:
 				if logCmd: logCmd(logging.ERROR); logCmd = None
 				logSys.error("%x -- timed out after %s seconds." %
 					(realCmdId, timeout))
@@ -222,6 +379,22 @@ class Utils():
 					#logSys.debug("%s -- killed %s ", realCmd, retcode)
 				if retcode is None and not Utils.pid_exists(pgid): # pragma: no cover
 					retcode = signal.SIGKILL
+			# cancellation - terminate the command and its whole process tree
+			# without waiting for the full timeout (both signal levels here):
+			if canceled:
+				if logCmd: logCmd(logging.INFO); logCmd = None
+				logSys.info("%x -- canceled, terminating command", realCmdId)
+				failStage = None
+				try:
+					retcode, failStage = Utils.terminateProcess(popen)
+				except Exception as e:
+					failStage = failStage or 'SIGTERM'
+					logSys.error("%x -- failed to terminate canceled command "
+						"at stage %s: %s", realCmdId, failStage, e)
+					retcode = popen.poll()
+				if cancel_event is not None:
+					_setCancelInfo(cancel_event, engaged=True,
+						outcome='terminated', retcode=retcode, failStage=failStage)
 		except OSError as e:
 			if logCmd: logCmd(logging.ERROR); logCmd = None
 			stderr = "%s -- failed with %s" % (realCmd, e)

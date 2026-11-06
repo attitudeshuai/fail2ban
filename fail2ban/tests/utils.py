@@ -418,6 +418,7 @@ def gatherTests(regexps=None, opts=None):
 	tests.addTest(loadTests(servertestcase.ServerConfigReaderTests))
 	tests.addTest(loadTests(actiontestcase.CommandActionTest))
 	tests.addTest(loadTests(actionstestcase.ExecuteActions))
+	tests.addTest(loadTests(actionstestcase.ActionCancellationTest))
 	# Ticket, BanTicket, FailTicket
 	tests.addTest(loadTests(tickettestcase.TicketTests))
 	# FailManager

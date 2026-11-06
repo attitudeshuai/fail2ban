@@ -33,11 +33,12 @@ try:
 except ImportError:
 	from collections import Mapping
 from collections import OrderedDict
+from threading import Lock
 
 from .banmanager import BanManager, BanTicket
 from .ipdns import IPAddr
 from .jailthread import JailThread
-from .action import ActionBase, CommandAction, CallingMap
+from .action import ActionBase, CommandAction, CallingMap, ActionCommandCancelled
 from .mytime import MyTime
 from .observer import Observers
 from .utils import Utils
@@ -88,6 +89,13 @@ class Actions(JailThread, Mapping):
 		self.banPrecedence = 10
 		## Max count of outdated tickets to unban per each __checkUnBan operation:
 		self.unbanMaxCount = self.banPrecedence * 2
+		## Ban tickets interrupted by cancellation, not yet rolled back:
+		self.__canceledTickets = []
+		self.__cancelLock = Lock()
+		## Cumulative cancellation statistics (kept here so they survive
+		## removal/stop of the individual action objects):
+		self.__cancelCount = 0
+		self.__cancelFailCount = 0
 
 	@staticmethod
 	def _load_python_module(pythonModule):
@@ -135,6 +143,10 @@ class Actions(JailThread, Mapping):
 			# don't create new action if reload supported:
 			action = self._actions[name]
 			if hasattr(action, 'reload'):
+				# cancel a command still running with the old parameters,
+				# so it cannot keep modifying the firewall after reload:
+				self.cancelActions(OrderedDict(((name, action),)))
+				self._waitActionsSettle(((name, action),))
 				# don't execute reload right now, reload after all parameters are actualized
 				if hasattr(action, 'clearAllParams'):
 					action.clearAllParams()
@@ -163,10 +175,16 @@ class Actions(JailThread, Mapping):
 				delacts = OrderedDict((name, action) for name, action in self._actions.items()
 					if name not in self._reload_actions)
 				if len(delacts):
+					# cancel commands still running with the obsolete actions:
+					self.cancelActions(delacts)
+					self._waitActionsSettle(list(delacts.items()))
 					# unban all tickets using removed actions only:
 					self.__flushBan(db=False, actions=delacts, stop=True)
 					# stop and remove it:
 					self.stopActions(actions=delacts)
+				# bans interrupted by the reload go back to unfinished state
+				# (and are requeued while the actions thread is still active):
+				self.__finalizeCancelledTickets(requeue=bool(self.active))
 				delattr(self, '_reload_actions')
 
 	def __getitem__(self, name):
@@ -315,6 +333,142 @@ class Actions(JailThread, Mapping):
 			del self._actions[name]
 			logSys.debug("%s: action %s terminated", self._jail.name, name)
 
+	def stop(self):
+		"""Sets the thread inactive and cancels any command still running.
+
+		Unlike the plain thread stop, an in-progress action command is
+		cancelled here, so it terminates (together with its process tree)
+		instead of running until its timeout while the clean-up waits.
+		"""
+		if self.active:
+			self.active = False
+			# signal cancellation to all in-flight action commands:
+			self.cancelActions(self._actions)
+		JailThread.stop(self)
+
+	def cancelActions(self, actions=None):
+		"""Requests cancellation of commands currently executed by `actions`.
+
+		Cancellation is only signalled here - the actions thread performs
+		the process termination, so this never blocks on process handling.
+		A failure for one action is logged (with action and stage) and
+		counted, but does not prevent cancelling the remaining actions.
+
+		Returns
+		-------
+		int
+			Number of in-progress commands signalled.
+		"""
+		if actions is None:
+			actions = self._actions
+		n = 0
+		for name, action in list(actions.items()):
+			try:
+				if hasattr(action, 'cancel'):
+					n += action.cancel()
+			except Exception as e:
+				self._noteCancel(failed=True)
+				logSys.error("Failed to cancel jail '%s' action '%s' at "
+					"stage 'signal': %s", self._jail.name, name, e,
+					exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+		return n
+
+	def _waitActionsSettle(self, actions, timeout=5):
+		"""Waits up to `timeout` seconds for in-progress commands of
+		`actions` to finish their (already signalled) cancellation.
+
+		Does not raise - a still running command is only logged, so one
+		slow/failed action cannot block the stop/reload of the others.
+		"""
+		endtm = MyTime.time() + timeout
+		for name, action in actions:
+			if not hasattr(action, 'activeCommands'):
+				continue
+			tm = max(0, endtm - MyTime.time())
+			if not Utils.wait_for(
+				lambda a=action: not a.activeCommands(), tm, 0.005):
+				logSys.error("Jail '%s' action '%s' is still executing a "
+					"command %.1f seconds after cancellation",
+					self._jail.name, name, timeout)
+
+	def activeCommands(self):
+		"""Returns a list of "action: command" entries currently executing.
+		"""
+		ret = []
+		for name, action in self._actions.items():
+			if not hasattr(action, 'activeCommands'):
+				continue
+			for cmd in action.activeCommands():
+				ret.append("%s: %s" % (name, cmd))
+		return ret
+
+	def _noteCancel(self, failed=False):
+		"""Accounts one completed command cancellation (failed if the
+		process could not be terminated/reaped).
+		"""
+		self.__cancelCount += 1
+		if failed:
+			self.__cancelFailCount += 1
+
+	def getCancelStats(self):
+		"""Returns (cumulative cancellations, cumulative cancel failures).
+		"""
+		return self.__cancelCount, self.__cancelFailCount
+
+	def __markTicketCancelled(self, ticket):
+		"""Marks a ticket whose ban was cancelled as unfinished.
+
+		The ticket stays in the ban manager until the shutdown flush
+		resp. reload finalization (so partial firewall changes can still
+		be repealed), but it is never shown as banned nor finalized again.
+		"""
+		ticket.cancelled = True
+		ticket.banned = False
+		with self.__cancelLock:
+			self.__canceledTickets.append(ticket)
+		logSys.info("[%s] Ban of %s cancelled, ticket back to unfinished",
+			self._jail.name, ticket.getID())
+
+	def __finalizeCancelledTickets(self, requeue=False):
+		"""Rolls back all pending cancelled tickets.
+
+		Removes them from the ban manager, deletes their persistent
+		records (restored tickets keep the record they were restored
+		from) and optionally requeues them as unfinished failures (reload).
+		Idempotent - safe to invoke from both the actions thread and the
+		reload/stop finalization.
+		"""
+		with self.__cancelLock:
+			tickets = self.__canceledTickets
+			self.__canceledTickets = []
+		for ticket in tickets:
+			try:
+				removed = self.banManager.removeBanTicket(ticket)
+				if not removed:
+					# the ticket was swept by the shutdown flush (which keeps
+					# the cumulative total) - undo the add-ban increments too:
+					self.banManager.setBanTotal(
+						max(0, self.banManager.getBanTotal() - 1))
+					try:
+						ticket.incrBanCount(-1)
+					except Exception: # pragma: no cover
+						pass
+					ticket.banned = False
+				# remove persistent record (never created for restored ones):
+				if not ticket.restored and self._jail.database is not None:
+					self._jail.database.delBan(self._jail, ticket.getID())
+				if requeue:
+					# back to the fail queue, to be banned with new params:
+					ticket.cancelled = False
+					self._jail.putFailTicket(ticket)
+				logSys.debug("[%s] canceled ticket %s rolled back (requeue=%s)",
+					self._jail.name, ticket.getID(), requeue)
+			except Exception as e:
+				logSys.error("Failed to roll back canceled ticket %s in jail "
+					"'%s': %s", ticket.getID(), self._jail.name, e,
+					exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+		return len(tickets)
+
 
 	def run(self):
 		"""Main loop for Threading.
@@ -358,13 +512,28 @@ class Actions(JailThread, Mapping):
 						logSys.log(5, "Actions: check-unban %s, bancnt %s, max: %s", bancnt if bancnt and bancnt < self.unbanMaxCount else self.unbanMaxCount, bancnt, self.unbanMaxCount)
 						self.__checkUnBan(bancnt if bancnt and bancnt < self.unbanMaxCount else self.unbanMaxCount)
 					cnt = 0
+			except ActionCommandCancelled:
+				# a ban/unban command was cancelled (stop or reload).
+				# on stop the loop ends and the ticket is rolled back after
+				# the shutdown flush below; on reload the finalization is
+				# done by reload(begin=False). If no reload is in progress
+				# (direct cancel), settle the ticket now:
+				if self.active and not hasattr(self, '_reload_actions'):
+					self.__finalizeCancelledTickets(requeue=True)
+				# continue - either leave the loop (inactive) or go idle,
+				# the interrupted fail ticket stays queued for reprocessing:
+				continue
 			except Exception as e: # pragma: no cover
 				logSys.error("[%s] unhandled error in actions thread: %s",
 					self._jail.name, e,
 					exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
 
+		# repeal all still active bans (this also undoes partially executed
+		# bans of cancelled tickets), then roll those tickets back so they
+		# are not shown as banned and no persistent record remains:
 		self.__flushBan(stop=True)
 		self.stopActions()
+		self.__finalizeCancelledTickets()
 		return True
 
 	class ActionInfo(CallingMap):
@@ -490,73 +659,92 @@ class Actions(JailThread, Mapping):
 		"""
 		cnt = 0
 		if not tickets:
-			tickets = self.__getFailTickets(self.banPrecedence)
+			# materialize the batch so tickets not processed when a
+			# cancellation aborts it can be put back to the fail queue:
+			tickets = list(self.__getFailTickets(self.banPrecedence))
 		rebanacts = None
-		for ticket in tickets:
+		try:
+			for ticket_index, ticket in enumerate(tickets):
 
-			bTicket = BanTicket.wrap(ticket)
-			btime = ticket.getBanTime(self.banManager.getBanTime())
-			ip = bTicket.getID()
-			aInfo = self._getActionInfo(bTicket)
-			reason = {}
-			if self.banManager.addBanTicket(bTicket, reason=reason):
-				cnt += 1
-				# report ticket to observer, to check time should be increased and hereafter observer writes ban to database (asynchronous)
-				if Observers.Main is not None and not bTicket.restored:
-					Observers.Main.add('banFound', bTicket, self._jail, btime)
-				logSys.notice("[%s] %sBan %s", self._jail.name, ('' if not bTicket.restored else 'Restore '), ip)
-				# do actions :
-				for name, action in self._actions.items():
+				bTicket = BanTicket.wrap(ticket)
+				btime = ticket.getBanTime(self.banManager.getBanTime())
+				ip = bTicket.getID()
+				aInfo = self._getActionInfo(bTicket)
+				reason = {}
+				if self.banManager.addBanTicket(bTicket, reason=reason):
+					cnt += 1
+					# report ticket to observer, to check time should be increased and hereafter observer writes ban to database (asynchronous)
+					if Observers.Main is not None and not bTicket.restored:
+						Observers.Main.add('banFound', bTicket, self._jail, btime)
+					logSys.notice("[%s] %sBan %s", self._jail.name, ('' if not bTicket.restored else 'Restore '), ip)
+					# do actions :
 					try:
-						if bTicket.restored and getattr(action, 'norestored', False):
-							continue
-						if not aInfo.immutable: aInfo.reset()
-						action.ban(aInfo)
-					except Exception as e:
-						logSys.error(
-							"Failed to execute ban jail '%s' action '%s' "
-							"info '%r': %s",
-							self._jail.name, name, aInfo, e,
-							exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
-				# after all actions are processed set banned flag:
-				bTicket.banned = True
-				if self.banEpoch: # be sure tickets always have the same ban epoch (default 0):
-					bTicket.banEpoch = self.banEpoch
-			else:
-				if reason.get('expired', 0):
-					logSys.info('[%s] Ignore %s, expired bantime', self._jail.name, ip)
-					continue
-				bTicket = reason.get('ticket', bTicket)
-				# if already banned (otherwise still process some action)
-				if bTicket.banned:
-					# compare time of failure occurrence with time ticket was really banned:
-					diftm = ticket.getTime() - bTicket.getTime()
-					# log already banned with following level:
-					#   DEBUG   - before 3 seconds - certain interval for it, because of possible latency by recognizing in backends, etc.
-					#   NOTICE  - before 60 seconds - may still occur if action is slow, or very high load in backend,
-					#   WARNING - after 60 seconds - very long time, something may be wrong
-					ll = logging.DEBUG   if diftm < 3 \
-					else logging.NOTICE  if diftm < 60 \
-					else logging.WARNING
-					logSys.log(ll, "[%s] %s already banned", self._jail.name, ip)
-					# if long time after ban - do consistency check (something is wrong here):
-					if bTicket.banEpoch == self.banEpoch and diftm > 3:
-						# avoid too often checks:
-						if not rebanacts and MyTime.time() > self.__lastConsistencyCheckTM + 3:
-							self.__lastConsistencyCheckTM = MyTime.time()
-							for action in self._actions.values():
-								if hasattr(action, 'consistencyCheck'):
-									action.consistencyCheck()
-					# check epoch in order to reban it:
-					if bTicket.banEpoch < self.banEpoch:
-						if not rebanacts: rebanacts = dict(
-							(name, action) for name, action in self._actions.items()
-								if action.banEpoch > bTicket.banEpoch)
-						cnt += self.__reBan(bTicket, actions=rebanacts)
-				else: # pragma: no cover - unexpected: ticket is not banned for some reasons - reban using all actions:
-					cnt += self.__reBan(bTicket)
-			# add ban to database moved to observer (should previously check not already banned 
-			# and increase ticket time if "bantime.increment" set)
+						for name, action in self._actions.items():
+							try:
+								if bTicket.restored and getattr(action, 'norestored', False):
+									continue
+								if not aInfo.immutable: aInfo.reset()
+								action.ban(aInfo)
+							except ActionCommandCancelled:
+								# interrupted by stop/reload - skip remaining actions:
+								raise
+							except Exception as e:
+								logSys.error(
+									"Failed to execute ban jail '%s' action '%s' "
+									"info '%r': %s",
+									self._jail.name, name, aInfo, e,
+									exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+						# after all actions are processed set banned flag:
+						bTicket.banned = True
+						if self.banEpoch: # be sure tickets always have the same ban epoch (default 0):
+							bTicket.banEpoch = self.banEpoch
+					except ActionCommandCancelled:
+						# the ban was cancelled while in progress - the ticket goes back
+						# to unfinished state (never marked as banned/persisted):
+						self.__markTicketCancelled(bTicket)
+						raise
+				else:
+					if reason.get('expired', 0):
+						logSys.info('[%s] Ignore %s, expired bantime', self._jail.name, ip)
+						continue
+					bTicket = reason.get('ticket', bTicket)
+					# if already banned (otherwise still process some action)
+					if bTicket.banned:
+						# compare time of failure occurrence with time ticket was really banned:
+						diftm = ticket.getTime() - bTicket.getTime()
+						# log already banned with following level:
+						#   DEBUG   - before 3 seconds - certain interval for it, because of possible latency by recognizing in backends, etc.
+						#   NOTICE  - before 60 seconds - may still occur if action is slow, or very high load in backend,
+						#   WARNING - after 60 seconds - very long time, something may be wrong
+						ll = logging.DEBUG   if diftm < 3 \
+						else logging.NOTICE  if diftm < 60 \
+						else logging.WARNING
+						logSys.log(ll, "[%s] %s already banned", self._jail.name, ip)
+						# if long time after ban - do consistency check (something is wrong here):
+						if bTicket.banEpoch == self.banEpoch and diftm > 3:
+							# avoid too often checks:
+							if not rebanacts and MyTime.time() > self.__lastConsistencyCheckTM + 3:
+								self.__lastConsistencyCheckTM = MyTime.time()
+								for action in self._actions.values():
+									if hasattr(action, 'consistencyCheck'):
+										action.consistencyCheck()
+						# check epoch in order to reban it:
+						if bTicket.banEpoch < self.banEpoch:
+							if not rebanacts: rebanacts = dict(
+								(name, action) for name, action in self._actions.items()
+									if action.banEpoch > bTicket.banEpoch)
+							cnt += self.__reBan(bTicket, actions=rebanacts)
+					else: # pragma: no cover - unexpected: ticket is not banned for some reasons - reban using all actions:
+						cnt += self.__reBan(bTicket)
+				# add ban to database moved to observer (should previously check not already banned
+				# and increase ticket time if "bantime.increment" set)
+		except ActionCommandCancelled:
+			# requeue tickets of this batch not processed yet (the
+			# interrupted one itself is handled via finalization):
+			if self.active:
+				for t in tickets[ticket_index+1:]:
+					self._jail.putFailTicket(t)
+			raise
 		if cnt:
 			logSys.debug("Banned %s / %s, %s ticket(s) in %r", cnt, 
 				self.banManager.getBanTotal(), self.banManager.size(), self._jail.name)
@@ -583,6 +771,10 @@ class Actions(JailThread, Mapping):
 				logSys.debug("[%s] action %r: reban %s", self._jail.name, name, ip)
 				if not aInfo.immutable: aInfo.reset()
 				action.reban(aInfo)
+			except ActionCommandCancelled:
+				# reban of an already banned ticket was cancelled -
+				# the original ban stays untouched (no rollback):
+				raise
 			except Exception as e:
 				logSys.error(
 					"Failed to execute reban jail '%s' action '%s' "
@@ -612,6 +804,9 @@ class Actions(JailThread, Mapping):
 					aInfo = self._getActionInfo(ticket)
 				if not aInfo.immutable: aInfo.reset()
 				action.prolong(aInfo)
+			except ActionCommandCancelled:
+				logSys.debug("[%s] prolong canceled for action %r",
+					self._jail.name, name)
 			except Exception as e:
 				logSys.error(
 					"Failed to execute ban jail '%s' action '%s' "
@@ -657,6 +852,9 @@ class Actions(JailThread, Mapping):
 					logSys.notice("[%s] Flush ticket(s) with %s", self._jail.name, name)
 					if action.flush():
 						continue
+			except ActionCommandCancelled:
+				# flush/repeal interrupted by cancellation - abort quietly:
+				raise
 			except Exception as e:
 				logSys.error("Failed to flush bans in jail '%s' action '%s': %s",
 					self._jail.name, name, e,
@@ -711,6 +909,9 @@ class Actions(JailThread, Mapping):
 				logSys.debug("[%s] action %r: unban %s", self._jail.name, name, ip)
 				if not aInfo.immutable: aInfo.reset()
 				action.unban(aInfo)
+			except ActionCommandCancelled:
+				# unban interrupted by cancellation - abort quietly:
+				raise
 			except Exception as e:
 				logSys.error(
 					"Failed to execute unban jail '%s' action '%s' "
@@ -722,11 +923,17 @@ class Actions(JailThread, Mapping):
 		"""Status of current and total ban counts and current banned IP list.
 		"""
 		# TODO: Allow this list to be printed as 'status' output
-		supported_flavors = ["short", "basic", "stats", "cymru"]
+		supported_flavors = ["short", "basic", "stats", "cymru", "cancellations"]
 		if flavor is None or flavor not in supported_flavors:
 			logSys.warning("Unsupported extended jail status flavor %r. Supported: %s" % (flavor, supported_flavors))
 		if flavor == "stats":
 			return (self.banManager.size(), self.banManager.getBanTotal())
+		# cancellation statistics and currently executing commands:
+		if flavor == "cancellations":
+			canceled, failed = self.getCancelStats()
+			return [("Currently executing", self.activeCommands()),
+				("Total cancelled", canceled),
+				("Total cancel failures", failed)]
 		# Always print this information (basic)
 		if flavor != "short":
 			banned = self.banManager.getBanList()

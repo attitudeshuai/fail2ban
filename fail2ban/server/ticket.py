@@ -39,6 +39,8 @@ class Ticket(object):
 	
 	RESTORED = 0x01
 	BANNED   = 0x08
+	# ban in progress was cancelled (stop/reload) - ticket is back to unfinished:
+	CANCELLED = 0x10
 
 	def __init__(self, ip=None, time=None, matches=None, data={}, ticket=None):
 		"""Ticket constructor
@@ -174,6 +176,16 @@ class Ticket(object):
 			self._flags |= Ticket.BANNED
 		else:
 			self._flags &= ~(Ticket.BANNED)
+
+	@property
+	def cancelled(self):
+		return self._flags & Ticket.CANCELLED
+	@cancelled.setter
+	def cancelled(self, value):
+		if value:
+			self._flags |= Ticket.CANCELLED
+		else:
+			self._flags &= ~(Ticket.CANCELLED)
 
 	def setData(self, *args, **argv):
 		# if overwrite - set data and filter None values:

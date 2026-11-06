@@ -297,6 +297,33 @@ class BanManager:
 				self._nextUnbanTime = eob
 			return True
 
+	def removeBanTicket(self, ticket):
+		"""Roll back an added ban ticket (e.g. its ban was cancelled).
+
+		Removes the ticket only if it is the very same instance still
+		contained in the ban list (a newer ticket for the same ID is
+		left untouched), undoes the ban total and ban count increments,
+		and clears the banned flag.
+
+		Returns
+		-------
+		bool
+			True if the ticket was present (same instance) and removed.
+		"""
+		fid = ticket.getID()
+		with self.__lock:
+			if self.__banList.get(fid) is not ticket:
+				return False
+			del self.__banList[fid]
+			self.__banTotal -= 1
+		# undo the ban-count increment done by addBanTicket (outside lock):
+		try:
+			ticket.incrBanCount(-1)
+		except Exception: # pragma: no cover
+			pass
+		ticket.banned = False
+		return True
+
 	##
 	# Get the size of the ban list.
 	#

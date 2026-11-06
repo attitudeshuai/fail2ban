@@ -29,6 +29,7 @@ import time
 import tempfile
 import os
 import re
+import subprocess
 import sys
 import platform
 
@@ -38,7 +39,7 @@ from ..server.server import Server
 from ..server.ipdns import DNSUtils, IPAddr
 from ..server.jail import Jail
 from ..server.jailthread import JailThread
-from ..server.ticket import BanTicket
+from ..server.ticket import BanTicket, FailTicket
 from ..server.utils import Utils
 from .dummyjail import DummyJail
 from .utils import LogCaptureTestCase, with_alt_time, MyTime
@@ -374,6 +375,149 @@ class Transmitter(TransmitterBase):
 			self.transm.proceed(
 				["set", self.jailName, "unbanip", "192.0.2.255", "192.0.2.254"]),(0, 0))
 		self.assertLogged("192.0.2.255 is not banned", "192.0.2.254 is not banned", all=True, wait=True)
+
+	@staticmethod
+	def _cancelTreeScript(marker, duration=30):
+		fn = tempfile.mktemp('.sh', 'f2b_it_')
+		with open(fn, 'w') as f:
+			f.write('#!/bin/sh\n')
+			f.write('echo $$ > "%s"\n' % marker)
+			f.write('sleep %d & echo $! >> "%s"\n' % (duration, marker))
+			f.write('wait\n')
+		return fn
+
+	@staticmethod
+	def _procState(pid):
+		try:
+			return subprocess.run(
+				['ps', '-o', 'state=', '-p', str(pid)],
+				stdout=subprocess.PIPE, stderr=subprocess.PIPE
+			).stdout.decode().strip()
+		except Exception:
+			return None
+
+	def _addLongBanningJail(self, jn, marker, duration=30):
+		script = self._cancelTreeScript(marker, duration)
+		self.server.addJail(jn, FAST_BACKEND)
+		self.assertEqual(
+			self.transm.proceed(["set", jn, "addaction", "a"]), (0, "a"))
+		for key, val in (("actionstart", ""), ("actionstop", ""),
+				("actionunban", ""), ("actionflush", ""),
+				("actionreload", "")):
+			self.assertEqual(
+				self.transm.proceed(["set", jn, "action", "a", key, val]),
+				(0, val))
+		self.assertEqual(
+			self.transm.proceed(
+				["set", jn, "action", "a", "actionban", 'sh "%s"' % script]),
+			(0, 'sh "%s"' % script))
+		self.server.startJail(jn)
+		return script, self.server._Server__jails[jn]
+
+	def _waitTreePids(self, marker):
+		def _pids():
+			try:
+				pids = [int(x) for x in open(marker).read().split()]
+				return pids if len(pids) == 2 else None
+			except (IOError, ValueError):
+				return None
+		pids = Utils.wait_for(_pids, 5)
+		self.assertTrue(pids, "process tree for %r not spawned" % marker)
+		return pids
+
+	def testStopAllJailCancelsInFlightCommands(self):
+		tmpfiles = []
+		jails = {}
+		try:
+			for jn, ip in (('J-cancel-1', '192.0.2.71'),
+					('J-cancel-2', '192.0.2.72')):
+				marker = tempfile.mktemp('.pid', 'f2b_it_')
+				tmpfiles.append(marker)
+				script, jail = self._addLongBanningJail(jn, marker)
+				tmpfiles.append(script)
+				jails[jn] = (jail, marker)
+				jail.putFailTicket(FailTicket(ip))
+			# both action commands must be in progress (note commands are
+			# serialized by the global command lock, so one is still queued
+			# - its token is registered nonetheless):
+			self.assertTrue(Utils.wait_for(
+				lambda: all(j.actions.activeCommands()
+					for j, m in jails.values()), 5))
+			# exactly one jail really spawned its process tree, the other
+			# is still queued behind the global command lock:
+			def _running():
+				for jn, (jail, marker) in jails.items():
+					try:
+						pids = [int(x) for x in open(marker).read().split()]
+						if len(pids) == 2:
+							return jn, pids
+					except (IOError, ValueError):
+						pass
+				return None
+			running = Utils.wait_for(_running, 5)
+			self.assertTrue(running)
+			rname, rpids = running
+			queued = [jn for jn in jails if jn != rname][0]
+			qmarker = jails[queued][1]
+			stime = time.time()
+			self.server.quit()
+			elapsed = time.time() - stime
+			# shutdown is prompt instead of waiting for the 30s timeouts:
+			self.assertLess(elapsed, 10, "shutdown took %.2fs" % elapsed)
+			# the running tree is terminated and fully reaped:
+			self.assertTrue(Utils.wait_for(
+				lambda: all(self._procState(p) == '' for p in rpids), 3),
+				"residual process tree in %s" % rname)
+			# the queued command was canceled before it ever spawned:
+			self.assertFalse(os.path.exists(qmarker))
+			for jail, marker in jails.values():
+				self.assertFalse(jail.isAlive())
+				self.assertEqual(jail.actions.getCancelStats(), (1, 0))
+		finally:
+			for fn in tmpfiles:
+				try: os.unlink(fn)
+				except OSError: pass
+
+	def testReloadJailCancelsOnlyAffectedJail(self):
+		tmpfiles = []
+		try:
+			rmarker = tempfile.mktemp('.pid', 'f2b_it_r_')
+			tmpfiles.append(rmarker)
+			rscript, rjail = self._addLongBanningJail('J-reloaded', rmarker)
+			tmpfiles.append(rscript)
+			# second jail, short command, must be untouched by the reload:
+			self.server.addJail('J-kept', FAST_BACKEND)
+			self.assertEqual(self.transm.proceed(
+				["set", 'J-kept', "addaction", "a"]), (0, "a"))
+			self.assertEqual(self.transm.proceed(
+				["set", 'J-kept', "action", "a", "actionban",
+					"echo KEEPBAN <ip>"]), (0, "echo KEEPBAN <ip>"))
+			self.server.startJail('J-kept')
+			kjail = self.server._Server__jails['J-kept']
+			rjail.putFailTicket(FailTicket('192.0.2.81'))
+			kjail.putFailTicket(FailTicket('192.0.2.82'))
+			rpids = self._waitTreePids(rmarker)
+			# reload only the reloaded jail (full client reload sequence):
+			self.server.reloadJails('J-reloaded', [], begin=True)
+			self.server.addJail('J-reloaded', FAST_BACKEND)
+			self.assertEqual(self.transm.proceed(
+				["set", 'J-reloaded', "addaction", "a"]), (0, "a"))
+			self.assertEqual(self.transm.proceed(
+				["set", 'J-reloaded', "action", "a", "actionban",
+					"echo NEWBAN <ip>"]), (0, "echo NEWBAN <ip>"))
+			self.server.startJail('J-reloaded')
+			self.server.reloadJails('J-reloaded', [], begin=False)
+			# old tree dead, requeued ticket banned with the new command:
+			self.assertTrue(Utils.wait_for(
+				lambda: all(self._procState(p) == '' for p in rpids), 3))
+			self.assertLogged('NEWBAN 192.0.2.81', wait=True)
+			self.assertLogged('KEEPBAN 192.0.2.82', wait=True)
+			self.assertEqual(rjail.actions.getCancelStats(), (1, 0))
+			self.assertEqual(kjail.actions.getCancelStats(), (0, 0))
+		finally:
+			for fn in tmpfiles:
+				try: os.unlink(fn)
+				except OSError: pass
 
 	def testJailAttemptIP(self):
 		self.server.startJail(self.jailName) # Jail must be started
