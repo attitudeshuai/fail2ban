@@ -533,6 +533,27 @@ class Fail2BanDb(object):
 						"VALUES(?, ?, ?, ?)", (jail.name, name, md5, pos))
 
 	@commitandrollback
+	def delLog(self, cur, jail, container):
+		"""Removes a log (and its persisted read position) from the database.
+
+		Used when a log path is removed from monitoring, so re-adding the
+		same path later starts from a fresh position instead of resuming
+		at the removed offset.
+
+		Parameters
+		----------
+		jail : Jail
+			Jail of which the log file belongs to.
+		container : FileContainer
+			File container of the log file being removed.
+		"""
+		self._delLog(cur, jail, container.getFileName())
+
+	def _delLog(self, cur, jail, name):
+		cur.execute(
+			"DELETE FROM logs WHERE jail=? AND path=?", (jail.name, name))
+
+	@commitandrollback
 	def getJournalPos(self, cur, jail, name, time=0, iso=None):
 		"""Get journal position from database.
 

@@ -289,6 +289,18 @@ class DatabaseTest(LogCaptureTestCase):
 			self.db.addLog(self.jail, self.fileContainer), None)
 		os.remove(filename)
 
+	def testDelLog(self):
+		self._testAddLog() # Add log file
+		filename = self.fileContainer.getFileName()
+		self.assertIn(filename, self.db.getLogPaths(self.jail))
+		# remove the log - its persisted position disappears:
+		self.db.delLog(self.jail, self.fileContainer)
+		self.assertNotIn(filename, self.db.getLogPaths(self.jail))
+		# removing again (unknown log) is harmless:
+		self.db.delLog(self.jail, self.fileContainer)
+		# other jails are unaffected and addLog starts without offset:
+		self.assertIsNone(self.db.addLog(self.jail, self.fileContainer))
+
 	def testUpdateJournal(self):
 		self.testAddJail() # Jail required
 		# not yet updated:

@@ -46,6 +46,54 @@ from ..helpers import getLogger, PREFER_ENC
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
 
+
+class FileProcessingState(object):
+	"""Per log file processing state.
+
+	Each monitored log file owns its own instance, so multi-line buffer,
+	date/time context, pending multi-line failure records (mlfid) and
+	line/failure counters of one file can never contaminate another file
+	monitored by the same jail -- even when the processing of several
+	files interleaves (or happens concurrently).
+	"""
+
+	__slots__ = (
+		'lineBuffer', 'lastTimeText', 'lastDate', 'mlfidCache',
+		'processedLine', 'procLines', 'failCount', 'errors',
+	)
+
+	def __init__(self):
+		## Multi-line line buffer (tuples produced by date splitting).
+		self.lineBuffer = []
+		## Store last time stamp, applicable for multi-line.
+		self.lastTimeText = ""
+		self.lastDate = None
+		## Cache holding pending multi-line failures keyed by mlfid.
+		self.mlfidCache = None
+		## Last processed line (lazy convertor to string).
+		self.processedLine = None
+		## Processed lines counter.
+		self.procLines = 0
+		## Counter of matched failures.
+		self.failCount = 0
+		## Error counter (after 100 errors at once the processing goes idle).
+		self.errors = 0
+
+	def resetMultiLine(self):
+		"""Discard the multi-line buffer and pending records only.
+
+		Used on log rotation / truncation, so a half record of the old
+		file content is never completed by a line of the new content
+		(and vice versa).
+		"""
+		self.lineBuffer = []
+		self.mlfidCache = None
+
+	def getMlfidCache(self):
+		if self.mlfidCache is None:
+			self.mlfidCache = Utils.Cache(maxCount=100, maxTime=5*60)
+		return self.mlfidCache
+
 ##
 # Log reader class.
 #
@@ -89,19 +137,16 @@ class Filter(JailThread):
 		self.__ignoreCache = None
 		## Size of line buffer
 		self.__lineBufferSize = 1
-		## Line buffer
-		self.__lineBuffer = []
-		## Store last time stamp, applicable for multi-line
-		self.__lastTimeText = ""
-		self.__lastDate = None
+		## Processing state (multi-line buffer, date context, pending records,
+		## counters). Default state is used by line processing without a file
+		## (systemd journal, fail2ban-regex); FileFilter uses a per-file state.
+		self.__procState = FileProcessingState()
 		## Next service (cleanup) time
 		self.__nextSvcTime = -(1<<63)
 		## if set, treat log lines without explicit time zone to be in this time zone
 		self.__logtimezone = None
 		## Default or preferred encoding (to decode bytes from file or journal):
 		self.__encoding = PREFER_ENC
-		## Cache temporary holds failures info (used by multi-line for wrapping e. g. conn-id to host):
-		self.__mlfidCache = None
 		## Error counter (protected, so can be used in filter implementations)
 		## if it reached 100 (at once), run-cycle will go idle
 		self._errors = 0
@@ -123,8 +168,6 @@ class Filter(JailThread):
 		self.inOperation = True
 		## Ticks counter
 		self.ticks = 0
-		## Processed lines counter
-		self.procLines = 0
 		## Thread name:
 		self.name="f2b/f."+self.jailName
 
@@ -137,6 +180,52 @@ class Filter(JailThread):
 	@property
 	def jailName(self):
 		return (self.jail is not None and self.jail.name or "~jailless~")
+
+	##
+	# Default processing state (line buffer, date context, pending records).
+	#
+	# File-bound processing (FileFilter.getFailures) passes its own per-file
+	# state to processLine/processLineAndAdd; the default state is used by
+	# journal filters and fail2ban-regex. The properties below delegate to
+	# the default state to keep the historical filter-wide interface.
+
+	def _getProcState(self, state=None):
+		return state if state is not None else self.__procState
+
+	@property
+	def __lineBuffer(self):
+		return self.__procState.lineBuffer
+	@__lineBuffer.setter
+	def __lineBuffer(self, value):
+		self.__procState.lineBuffer = value
+
+	@property
+	def __lastTimeText(self):
+		return self.__procState.lastTimeText
+	@__lastTimeText.setter
+	def __lastTimeText(self, value):
+		self.__procState.lastTimeText = value
+
+	@property
+	def __lastDate(self):
+		return self.__procState.lastDate
+	@__lastDate.setter
+	def __lastDate(self, value):
+		self.__procState.lastDate = value
+
+	@property
+	def procLines(self):
+		return self.__procState.procLines
+	@procLines.setter
+	def procLines(self, value):
+		self.__procState.procLines = value
+
+	@property
+	def processedLine(self):
+		return self.__procState.processedLine
+	@processedLine.setter
+	def processedLine(self, value):
+		self.__procState.processedLine = value
 
 	def clearAllParams(self):
 		""" Clear all lists/dicts parameters (used by reloading)
@@ -161,10 +250,7 @@ class Filter(JailThread):
 
 	@property
 	def mlfidCache(self):
-		if self.__mlfidCache:
-			return self.__mlfidCache
-		self.__mlfidCache = Utils.Cache(maxCount=100, maxTime=5*60)
-		return self.__mlfidCache
+		return self.__procState.getMlfidCache()
 
 	@property
 	def prefRegex(self):
@@ -632,17 +718,18 @@ class Filter(JailThread):
 			for args in args:
 				logSys.warning('[%s] ' + args[0], self.jailName, *args[1:])
 
-	def processLine(self, line, date=None):
+	def processLine(self, line, date=None, state=None):
 		"""Split the time portion from log msg and return findFailures on them
 		"""
+		state = self._getProcState(state)
 		logSys.log(7, "Working on line %r", line)
 
 		noDate = False
 		if date:
 			tupleLine = line
 			line = "".join(line)
-			self.__lastTimeText = tupleLine[1]
-			self.__lastDate = date
+			state.lastTimeText = tupleLine[1]
+			state.lastDate = date
 		else:
 			# try to parse date:
 			timeMatch = self.dateDetector.matchTime(line)
@@ -657,15 +744,15 @@ class Filter(JailThread):
 					if date is not None:
 						# Lets get the time part
 						date = date[0]
-						self.__lastTimeText = m
-						self.__lastDate = date
+						state.lastTimeText = m
+						state.lastDate = date
 					else:
 						logSys.error("findFailure failed to parse timeText: %s", m)
 				# matched empty value - date is optional or not available - set it to last known or now:
-				elif self.__lastDate and self.__lastDate > MyTime.time() - 60:
+				elif state.lastDate and state.lastDate > MyTime.time() - 60:
 					# set it to last known:
-					tupleLine = ("", self.__lastTimeText, line)
-					date = self.__lastDate
+					tupleLine = ("", state.lastTimeText, line)
+					date = state.lastDate
 				else:
 					# set it to now:
 					date = MyTime.time()
@@ -674,9 +761,9 @@ class Filter(JailThread):
 			# still no date - try to use last known:
 			if date is None:
 				noDate = True
-				if self.__lastDate and self.__lastDate > MyTime.time() - 60:
-					tupleLine = ("", self.__lastTimeText, line)
-					date = self.__lastDate
+				if state.lastDate and state.lastDate > MyTime.time() - 60:
+					tupleLine = ("", state.lastTimeText, line)
+					date = state.lastDate
 				elif self.checkFindTime and self.inOperation:
 					date = MyTime.time()
 		
@@ -697,7 +784,7 @@ class Filter(JailThread):
 						 line))
 					# simulate now as date:
 					date = MyTime.time()
-					self.__lastDate = date
+					state.lastDate = date
 			else:
 				# in initialization (restore) phase, if too old - ignore:
 				if date < MyTime.time() - self.getFindTime():
@@ -712,14 +799,15 @@ class Filter(JailThread):
 					return []
 
 		# save last line (lazy convert of process line tuple to string on demand):
-		self.processedLine = lambda: "".join(tupleLine[::2])
-		return self.findFailure(tupleLine, date, noDate=noDate)
+		state.processedLine = lambda: "".join(tupleLine[::2])
+		return self.findFailure(tupleLine, date, noDate=noDate, state=state)
 
-	def processLineAndAdd(self, line, date=None):
+	def processLineAndAdd(self, line, date=None, state=None):
 		"""Processes the line for failures and populates failManager
 		"""
+		state = self._getProcState(state)
 		try:
-			for (_, ip, unixTime, fail) in self.processLine(line, date):
+			for (_, ip, unixTime, fail) in self.processLine(line, date, state):
 				logSys.debug("Processing line with time:%s and ip:%s", 
 						unixTime, ip)
 				# ensure the time is not in the future, e. g. by some estimated (assumed) time:
@@ -731,6 +819,8 @@ class Filter(JailThread):
 				logSys.info(
 					"[%s] Found %s - %s", self.jailName, ip, MyTime.time2str(unixTime)
 				)
+				# count failure matches per file:
+				state.failCount += 1
 				attempts = self.failManager.addFailure(tick)
 				# avoid RC on busy filter (too many failures) - if attempts for IP/ID reached maxretry,
 				# we can speedup ban, so do it as soon as possible:
@@ -739,30 +829,36 @@ class Filter(JailThread):
 				# report to observer - failure was found, for possibly increasing of it retry counter (asynchronous)
 				if Observers.Main is not None:
 					Observers.Main.add('failureFound', self.jail, tick)
-			self.procLines += 1
+			state.procLines += 1
 			# every 100 lines check need to perform service tasks:
-			if self.procLines % 100 == 0:
+			if state.procLines % 100 == 0:
 				self.performSvc()
 			# reset (halve) error counter (successfully processed line):
-			if self._errors:
-				self._errors //= 2
+			if state.errors:
+				state.errors //= 2
+				self._errors = state.errors
 		except Exception as e:
 			logSys.error("Failed to process line: %r, caught exception: %r", line, e,
 				exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
 			# incr common error counter:
-			self.commonError()
+			self.commonError(state=state)
 
-	def commonError(self, reason="common", exc=None):
+	def commonError(self, reason="common", exc=None, state=None):
 		# incr error counter, stop processing (going idle) after 100th error :
-		self._errors += 1
+		state = self._getProcState(state)
+		state.errors += 1
+		# mirror the active file's error counter (single-file behavior identical):
+		self._errors = state.errors
 		# sleep a little bit (to get around time-related errors):
 		time.sleep(self.sleeptime)
-		if self._errors >= 100:
-			logSys.error("Too many errors at once (%s), going idle", self._errors)
-			self._errors //= 2
+		if state.errors >= 100:
+			logSys.error("Too many errors at once (%s), going idle", state.errors)
+			state.errors //= 2
+			self._errors = state.errors
 			self.idle = True
 
-	def _ignoreLine(self, buf, orgBuffer, failRegex=None):
+	def _ignoreLine(self, buf, orgBuffer, failRegex=None, state=None):
+		state = self._getProcState(state)
 		# if multi-line buffer - use matched only, otherwise (single line) - original buf:
 		if failRegex and self.__lineBufferSize > 1:
 			orgBuffer = failRegex.getMatchedTupleLines()
@@ -779,7 +875,7 @@ class Filter(JailThread):
 				if not self.checkAllRegex or self.__lineBufferSize > 1:
 					# todo: check ignoreRegex.getUnmatchedTupleLines() would be better (fix testGetFailuresMultiLineIgnoreRegex):
 					if failRegex:
-						self.__lineBuffer = failRegex.getUnmatchedTupleLines()
+						state.lineBuffer = failRegex.getUnmatchedTupleLines()
 				if not self.checkAllRegex: break
 		return fnd
 
@@ -793,8 +889,12 @@ class Filter(JailThread):
 			return users
 		return users
 
-	def _mergeFailure(self, mlfid, fail, failRegex):
-		mlfidFail = self.mlfidCache.get(mlfid) if self.__mlfidCache else None
+	def _mergeFailure(self, mlfid, fail, failRegex, state=None):
+		state = self._getProcState(state)
+		# pending records (mlfid cache) are per file - the same mlfid in
+		# another log file must never be merged here:
+		mlfidCache = state.mlfidCache
+		mlfidFail = mlfidCache.get(mlfid) if mlfidCache is not None else None
 		users = None
 		nfflgs = 0
 		if fail.get("mlfgained"):
@@ -822,11 +922,12 @@ class Filter(JailThread):
 			fail = mlfidGroups
 			# if forget (disconnect/reset) - remove cached entry:
 			if nfflgs & 2:
-				self.mlfidCache.unset(mlfid)
+				mlfidCache.unset(mlfid)
 		elif not (nfflgs & 2): # not mlfforget
 			users = self._updateUsers(fail, fail.get('user'))
-			mlfidFail = [self.__lastDate, fail]
-			self.mlfidCache.set(mlfid, mlfidFail)
+			mlfidFail = [state.lastDate, fail]
+			mlfidCache = state.getMlfidCache()
+			mlfidCache.set(mlfid, mlfidFail)
 		# check users in order to avoid reset failure by multiple logon-attempts:
 		if fail.pop('mlfpending', 0) or users and len(users) > 1:
 			# we've pending failures or new user, reset 'nofail' because of failures or multiple users attempts:
@@ -853,7 +954,8 @@ class Filter(JailThread):
 	# to find the logging time.
 	# @return a dict with IP and timestamp.
 
-	def findFailure(self, tupleLine, date, noDate=False):
+	def findFailure(self, tupleLine, date, noDate=False, state=None):
+		state = self._getProcState(state)
 		failList = list()
 
 		ll = logSys.getEffectiveLevel()
@@ -862,16 +964,16 @@ class Filter(JailThread):
 			defcidr = IPAddr.CIDR_RAW
 
 		if self.__lineBufferSize > 1:
-			self.__lineBuffer.append(tupleLine)
-			orgBuffer = self.__lineBuffer = self.__lineBuffer[-self.__lineBufferSize:]
+			state.lineBuffer.append(tupleLine)
+			orgBuffer = state.lineBuffer = state.lineBuffer[-self.__lineBufferSize:]
 		else:
-			orgBuffer = self.__lineBuffer = [tupleLine]
+			orgBuffer = state.lineBuffer = [tupleLine]
 		if ll <= 5: logSys.log(5, "Looking for match of %r", orgBuffer)
 		buf = Regex._tupleLinesBuf(orgBuffer)
 
 		# Checks if we must ignore this line (only if fewer ignoreregex than failregex).
 		if self.__ignoreRegex and len(self.__ignoreRegex) < len(self.__failRegex) - 2:
-			if self._ignoreLine(buf, orgBuffer) is not None:
+			if self._ignoreLine(buf, orgBuffer, state=state) is not None:
 				# The ignoreregex matched. Return.
 				return failList
 
@@ -888,14 +990,14 @@ class Filter(JailThread):
 			repl = preGroups.pop('content', None)
 			# Content replacement:
 			if repl:
-				self.__lineBuffer, buf = [('', '', repl)], None
+				state.lineBuffer, buf = [('', '', repl)], None
 
 		# Iterates over all the regular expressions.
 		for failRegexIndex, failRegex in enumerate(self.__failRegex):
 			try:
 				# buffer from tuples if changed: 
 				if buf is None:
-					buf = Regex._tupleLinesBuf(self.__lineBuffer)
+					buf = Regex._tupleLinesBuf(state.lineBuffer)
 				if ll <= 5: logSys.log(5, "  Looking for failregex %d - %r", failRegexIndex, failRegex.getRegex())
 				failRegex.search(buf, orgBuffer)
 				if not failRegex.hasMatched():
@@ -905,7 +1007,7 @@ class Filter(JailThread):
 				# The failregex matched.
 				if ll <= 7: logSys.log(7, "  Matched failregex %d: %s", failRegexIndex, fail)
 				# Checks if we must ignore this match.
-				if self.__ignoreRegex and self._ignoreLine(buf, orgBuffer, failRegex) is not None:
+				if self.__ignoreRegex and self._ignoreLine(buf, orgBuffer, failRegex, state=state) is not None:
 					# The ignoreregex matched. Remove ignored match.
 					buf = None
 					if not self.checkAllRegex:
@@ -920,7 +1022,7 @@ class Filter(JailThread):
 					if date is None and self.checkFindTime: continue
 				# we should check all regex (bypass on multi-line, otherwise too complex):
 				if not self.checkAllRegex or self.__lineBufferSize > 1:
-					self.__lineBuffer, buf = failRegex.getUnmatchedTupleLines(), None
+					state.lineBuffer, buf = failRegex.getUnmatchedTupleLines(), None
 				# merge data if multi-line failure:
 				cidr = defcidr
 				raw = (defcidr == IPAddr.CIDR_RAW)
@@ -930,7 +1032,7 @@ class Filter(JailThread):
 				# first try to check we have mlfid case (caching of connection id by multi-line):
 				mlfid = fail.get('mlfid')
 				if mlfid is not None:
-					fail = self._mergeFailure(mlfid, fail, failRegex)
+					fail = self._mergeFailure(mlfid, fail, failRegex, state=state)
 					# bypass if no-failure case:
 					if fail.get('nofail'):
 						if ll <= 7: logSys.log(7, "Nofail by mlfid %r in regex %s: %s",
@@ -1009,6 +1111,9 @@ class FileFilter(Filter):
 		## The log file path.
 		self.__logs = dict()
 		self.__autoSeek = dict()
+		## Per-file processing state (multi-line buffer, date context,
+		## pending records, counters), keyed by log file path.
+		self.__fileStates = dict()
 
 	##
 	# Add a log file path
@@ -1029,6 +1134,8 @@ class FileFilter(Filter):
 				if lastpos and not tail:
 					log.setPos(lastpos)
 			self.__logs[path] = log
+			# each file gets its own fresh processing state:
+			self.__fileStates[path] = FileProcessingState()
 			logSys.info("Added logfile: %r (pos = %s, hash = %s)" , path, log.getPos(), log.getHash())
 			if autoSeek and not tail:
 				self.__autoSeek[path] = autoSeek
@@ -1042,16 +1149,38 @@ class FileFilter(Filter):
 	##
 	# Delete a log path
 	#
+	# Besides removing the log from monitoring it settles (discards) the
+	# per-file multi-line buffer, pending records and counters of exactly
+	# this file and removes its persisted read position, so a later
+	# re-adding starts from a fresh position.
+	#
 	# @param path the log file to delete
+	# @param keepPosition if True (used on stop), keep the database position
+	#       (service restart continues reading at each file's own position)
 
-	def delLogPath(self, path):
+	def delLogPath(self, path, keepPosition=False):
 		try:
 			log = self.__logs.pop(path)
 		except KeyError:
 			return
+		# settle this file only - its buffer, pending records and counters
+		# are dropped; other files' states remain untouched:
+		self.__fileStates.pop(path, None)
+		self.__autoSeek.pop(path, None)
 		logSys.info("Removed logfile: %r", path)
+		if not keepPosition:
+			# discard not yet flushed position of the removed file ...
+			self._pendDBUpdates.pop(log, None)
+			# ... and remove its persisted read position (no inheritance
+			# of the offset if the file gets monitored again later):
+			db = self.jail.database
+			if db is not None:
+				try:
+					db.delLog(self.jail, log)
+				except Exception as e: # pragma: no cover - defensive
+					logSys.error("Failed to remove position of logfile %r: %r", path, e)
 		self._delLogPath(path)
-		return
+		return log if keepPosition else None
 
 	def _delLogPath(self, path): # pragma: no cover - overwritten function
 		# nothing to do by default
@@ -1105,6 +1234,30 @@ class FileFilter(Filter):
 		return self.__logs.get(path, None)
 
 	##
+	# Get the per-file processing state (read lines / failure counters,
+	# date context, buffer). Returns None for files no longer monitored.
+	#
+	# @param path the log file path (or None for all files)
+	# @return FileProcessingState or list of (path, state) tuples
+
+	def getLogState(self, path=None):
+		if path is None:
+			return [(p, self.__fileStates[p]) for p in self.__logs]
+		return self.__fileStates.get(path, None)
+
+	##
+	# Readable per-file statistics: (read lines, failure matches) for one
+	# file or list of (path, read lines, failure matches) for all files.
+	# Counters reset to zero as soon as the file is removed from monitoring.
+
+	def getFileStats(self, path=None):
+		if path is not None:
+			state = self.__fileStates.get(path)
+			return None if state is None else (state.procLines, state.failCount)
+		return [(p, self.__fileStates[p].procLines, self.__fileStates[p].failCount)
+			for p in self.__logs]
+
+	##
 	# Gets all the failure in the log file.
 	#
 	# Gets all the failure in the log file which are newer than
@@ -1115,6 +1268,12 @@ class FileFilter(Filter):
 		if self.idle: return False
 		log = self.getLog(filename)
 		if log is None and self.active:
+			logSys.log(logging.MSG, "Unable to get failures in %s", filename)
+			return False
+		# each file is processed with its own state (buffer, date context,
+		# pending records and counters):
+		state = self.__fileStates.get(filename)
+		if state is None:
 			logSys.log(logging.MSG, "Unable to get failures in %s", filename)
 			return False
 		# We should always close log (file), otherwise may be locked (log-rotate, etc.)
@@ -1154,6 +1313,12 @@ class FileFilter(Filter):
 						logSys.exception(e)
 						return False
 
+			# rotation/truncation was detected - settle the residual
+			# multi-line buffer and pending records of THIS file only, so
+			# fragments of the old content can never be joined with new:
+			if log.takeRotation():
+				state.resetMultiLine()
+
 			if has_content:
 				while not self.idle:
 					line = log.readline()
@@ -1165,18 +1330,20 @@ class FileFilter(Filter):
 						break
 					# acquire in operation from log and process:
 					self.inOperation = inOperation if inOperation is not None else log.inOperation
-					self.processLineAndAdd(line)
+					self.processLineAndAdd(line, state=state)
 		finally:
 			log.close()
 		if self.jail.database is not None:
-			self._pendDBUpdates[log] = 1
-			if (
-				self.ticks % 100 == 0
-				or MyTime.time() >= self._nextUpdateTM
-				or not self.active
-			):
-				self._updateDBPending()
-				self._nextUpdateTM = MyTime.time() + Utils.DEFAULT_SLEEP_TIME * 5
+			# do not resurrect the position of a file removed meanwhile:
+			if filename in self.__logs:
+				self._pendDBUpdates[log] = 1
+				if (
+					self.ticks % 100 == 0
+					or MyTime.time() >= self._nextUpdateTM
+					or not self.active
+				):
+					self._updateDBPending()
+					self._nextUpdateTM = MyTime.time() + Utils.DEFAULT_SLEEP_TIME * 5
 		return True
 
 	##
@@ -1276,12 +1443,19 @@ class FileFilter(Filter):
 		ret = super(FileFilter, self).status(flavor=flavor)
 		if flavor == "stats":
 			return ret
+		# per-file read lines / failure matches (counters disappear, i. e.
+		# reset to zero, as soon as a file is removed from monitoring):
+		if flavor == "files":
+			return self.getFileStats()
 		path = list(self.__logs.keys())
 		ret.append(("File list", path))
 		return ret
 
 	def _updateDBPending(self):
 		"""Apply pending updates (log position) to database.
+
+		Each log file position is flushed independently, so an error
+		updating one file does not prevent flushing the other files.
 		"""
 		db = self.jail.database
 		while True:
@@ -1289,14 +1463,19 @@ class FileFilter(Filter):
 				log, args = self._pendDBUpdates.popitem()
 			except KeyError:
 				break
-			db.updateLog(self.jail, log)
+			try:
+				db.updateLog(self.jail, log)
+			except Exception as e: # pragma: no cover - defensive
+				logSys.error("Failed to update position of logfile %r: %r",
+					getattr(log, 'getFileName', lambda: log)(), e)
 			
 	def afterStop(self):
 		"""Stop monitoring of log-file(s). Invoked after run method.
 		"""
-		# stop files monitoring:
+		# settle the files one by one (each with its own buffer/pending
+		# state), keeping their read positions for a possible restart:
 		for path in list(self.__logs.keys()):
-			self.delLogPath(path)
+			self.delLogPath(path, keepPosition=True)
 		# ensure positions of pending logs are up-to-date:
 		if self._pendDBUpdates and self.jail.database:
 			self._updateDBPending()
@@ -1335,6 +1514,9 @@ class FileContainer:
 		self.__pos4hash = 0
 		self.__hash = ''
 		self.__hashNextTime = time.time() + 30
+		## Set by open() once a rotation/truncation was detected there;
+		## consumed and reset by takeRotation().
+		self.__rotated = False
 		# Try to open the file. Raises an exception if an error occurred.
 		handler = open(filename, 'rb')
 		if doOpen: # fail2ban-regex only (don't need to reopen it and check for rotation)
@@ -1393,6 +1575,17 @@ class FileContainer:
 	def setPos(self, value):
 		self.__pos = value
 
+	def takeRotation(self):
+		"""Return and clear the rotation/truncation flag.
+
+		Set by open() when a log rotation or truncation was detected, so
+		the caller (FileFilter.getFailures) can settle the per-file
+		multi-line state exactly once per rotation event.
+		"""
+		rotated = self.__rotated
+		self.__rotated = False
+		return rotated
+
 	def open(self, forcePos=None):
 		h = open(self.__filename, 'rb')
 		try:
@@ -1420,6 +1613,9 @@ class FileContainer:
 						(stats.st_size, self.__pos, stats.st_ino, self.__ino, myHash, self.__hash))
 					self.__ino = stats.st_ino
 					self.__pos = 0
+					# signal rotation/truncation (consumed by getFailures to
+					# reset the per-file multi-line state):
+					self.__rotated = True
 				self.__hash = myHash
 			# if nothing to read from file yet (empty or no new data):
 			if forcePos is not None:

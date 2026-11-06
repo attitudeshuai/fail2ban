@@ -40,6 +40,7 @@ from ..helpers import uni_bytes
 from ..server.jail import Jail
 from ..server.filterpoll import FilterPoll
 from ..server.filter import FailTicket, Filter, FileFilter, FileContainer
+from ..server.database import Fail2BanDb
 from ..server.failmanager import FailManagerEmpty
 from ..server.ipdns import asip, getfqdn, DNSUtils, IPAddr, IPAddrSet
 from ..server.mytime import MyTime
@@ -2116,6 +2117,227 @@ class GetFailures(LogCaptureTestCase):
 		_assert_correct_last_attempt(self, self.filter, output)
 
 		self.assertRaises(FailManagerEmpty, self.filter.failManager.toBan)
+
+	def _multiFileSetup(self, db=None):
+		"""Two empty temp files watched by one (fresh) multi-line filter."""
+		p1 = tempfile.mktemp(prefix='f2b-iso-1-', suffix='.log')
+		p2 = tempfile.mktemp(prefix='f2b-iso-2-', suffix='.log')
+		fopen(p1, 'wb').close(); fopen(p2, 'wb').close()
+		self.addCleanupFile(p1); self.addCleanupFile(p2)
+		if db is None:
+			jail = self.jail
+		else:
+			jail = DummyJail()
+			jail.database = db
+			db.addJail(jail)
+		f = FileFilter(jail)
+		f.active = True
+		f.setDatePattern(r'^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?')
+		f.addLogPath(p1, autoSeek=False)
+		f.addLogPath(p2, autoSeek=False)
+		return f, jail, p1, p2
+
+	def addCleanupFile(self, path):
+		# temp files are unlinked best-effort after the test:
+		def _rm(p=path):
+			try: os.unlink(p)
+			except OSError: pass
+		self.addCleanup(_rm)
+
+	@staticmethod
+	def _writeLines(path, lines, mode='w'):
+		with fopen(path, mode) as f:
+			f.write("".join(l + "\n" for l in lines))
+
+	@staticmethod
+	def _popTickets(jail):
+		tickets = []
+		while True:
+			ticket = jail.getFailTicket()
+			if not ticket:
+				break
+			tickets.append(ticket)
+		return tickets
+
+	def testGetFailuresMultiFileMultiLine(self):
+		# One jail, two files: half a multi-line record in file A must not
+		# be completed by a line from file B, and vice versa - even when
+		# reading of the two files interleaves.
+		f, jail, p1, p2 = self._multiFileSetup()
+		f.setMaxLines(3)
+		f.setMaxRetry(1)
+		f.addFailRegex(r"^.*start from <HOST>$<SKIPLINES>^.*end$")
+		# interleaved half records:
+		self._writeLines(p1, ["Aug 14 11:59:58 start from 192.0.2.1"])
+		self._writeLines(p2, ["Aug 14 11:59:10 start from 192.0.2.2"])
+		f.getFailures(p1); f.getFailures(p2)
+		self.assertEqual(f.failManager.getFailTotal(), 0)
+		s1, s2 = f.getLogState(p1), f.getLogState(p2)
+		# every file keeps its own buffer and its own date context:
+		self.assertEqual("".join(s1.lineBuffer[0]),
+			"Aug 14 11:59:58 start from 192.0.2.1")
+		self.assertEqual(s1.lineBuffer[0][1], "Aug 14 11:59:58")
+		self.assertEqual("".join(s2.lineBuffer[0]),
+			"Aug 14 11:59:10 start from 192.0.2.2")
+		self.assertEqual(s2.lineBuffer[0][1], "Aug 14 11:59:10")
+		self.assertEqual(f.getFileStats(p1), (1, 0))
+		self.assertEqual(f.getFileStats(p2), (1, 0))
+		# complete each record inside its own file (append, no rotation):
+		self._writeLines(p1, ["Aug 14 11:59:59 end"], mode='a')
+		self._writeLines(p2, ["Aug 14 11:59:11 end"], mode='a')
+		f.getFailures(p2); f.getFailures(p1)
+		tickets = self._popTickets(jail)
+		self.assertEqual(sorted(str(t.getID()) for t in tickets),
+			["192.0.2.1", "192.0.2.2"])
+		times = dict((str(t.getID()), t.getTime()) for t in tickets)
+		# failure time follows the completion line of the very same file:
+		self.assertEqual(times["192.0.2.1"], 1124013599.0)
+		self.assertEqual(times["192.0.2.2"], 1124013551.0)
+		self.assertEqual(f.getFileStats(p1), (2, 1))
+		self.assertEqual(f.getFileStats(p2), (2, 1))
+		self.assertEqual(dict((p, (n, c)) for p, n, c in f.status("files")),
+			{p1: (2, 1), p2: (2, 1)})
+		# removing one file settles only that file's state:
+		f.delLogPath(p2)
+		self.assertIsNone(f.getLogState(p2))
+		self.assertIsNone(f.getFileStats(p2))
+		self.assertTrue(f.containsLogPath(p1))
+		self.assertIsNotNone(f.getLogState(p1))
+
+	def testGetFailuresMultiFileDateContext(self):
+		# A line without time stamp only inherits the last time of the
+		# SAME file - never the one parsed from another monitored file.
+		f, jail, p1, p2 = self._multiFileSetup()
+		f.inOperation = True
+		f.addFailRegex(r"^.*fail from <HOST>$")
+		s1, s2 = f.getLogState(p1), f.getLogState(p2)
+		self.assertEqual(
+			f.processLine("Aug 14 11:59:59 fail from 192.0.2.10", state=s1)
+				[0][2], 1124013599.0)
+		self.assertEqual(s1.lastDate, 1124013599.0)
+		# the other file has never seen a time stamp - uses current time
+		# instead of inheriting file 1's last parsed date:
+		found = f.processLine("fail from 192.0.2.9", state=s2)
+		self.assertEqual(str(found[0][1]), "192.0.2.9")
+		self.assertIsNone(s2.lastDate)
+		self.assertEqual(found[0][2], MyTime.time())
+		# file 1 context untouched by file 2 processing:
+		self.assertEqual(s1.lastDate, 1124013599.0)
+
+	def testGetFailuresMultiFileMlfid(self):
+		# The same multi-line failure id (connection id) occurring in two
+		# files must produce two independent pending records.
+		f, jail, p1, p2 = self._multiFileSetup()
+		f.setMaxRetry(1)
+		f.addFailRegex(r"^.*<F-MLFID>conn \d+ </F-MLFID>opening$")
+		f.addFailRegex(r"^.*<F-MLFID>conn \d+ </F-MLFID>fail from <HOST>$")
+		self._writeLines(p1, ["Aug 14 11:59:58 conn 7 opening"])
+		self._writeLines(p2, ["Aug 14 11:59:10 conn 7 opening"])
+		f.getFailures(p1); f.getFailures(p2)
+		c1 = f.getLogState(p1).mlfidCache
+		c2 = f.getLogState(p2).mlfidCache
+		self.assertIsNotNone(c1)
+		self.assertIsNotNone(c2)
+		self.assertIsNot(c1, c2)
+		self.assertIsNotNone(c1.get('conn 7 '))
+		self.assertIsNotNone(c2.get('conn 7 '))
+		# same id, different file, own failure line each:
+		self._writeLines(p1, ["Aug 14 11:59:59 conn 7 fail from 192.0.2.11"], mode='a')
+		self._writeLines(p2, ["Aug 14 11:59:11 conn 7 fail from 192.0.2.22"], mode='a')
+		f.getFailures(p1); f.getFailures(p2)
+		tickets = self._popTickets(jail)
+		self.assertEqual(sorted(str(t.getID()) for t in tickets),
+			["192.0.2.11", "192.0.2.22"])
+
+	def testGetFailuresRotationResetsMultiLine(self):
+		# On rotation a half multi-line record of the old file content
+		# must be settled (discarded); it must not be completed by a line
+		# of the new file. The new content's own complete record still matches.
+		p = tempfile.mktemp(prefix='f2b-rot-', suffix='.log')
+		fopen(p, 'wb').close()
+		self.addCleanupFile(p)
+		f = FileFilter(self.jail)
+		f.active = True
+		f.setDatePattern(r'^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?')
+		f.setMaxLines(3)
+		f.setMaxRetry(1)
+		f.addFailRegex(r"^.*start from <HOST>$<SKIPLINES>^.*end$")
+		f.addLogPath(p, autoSeek=False)
+		self._writeLines(p, ["Aug 14 11:59:58 start from 192.0.2.5"])
+		f.getFailures(p)
+		self.assertEqual(len(f.getLogState(p).lineBuffer), 1)
+		# replace the file (new inode = rotation):
+		pnew = p + '.new'
+		self._writeLines(pnew, [
+			"Aug 14 11:59:10 end",
+			"Aug 14 11:59:11 start from 192.0.2.6",
+			"Aug 14 11:59:12 end",
+		])
+		os.replace(pnew, p)
+		f.getFailures(p)
+		tickets = self._popTickets(self.jail)
+		self.assertEqual([str(t.getID()) for t in tickets], ["192.0.2.6"])
+		self.assertEqual(tickets[0].getTime(), 1124013552.0)
+		self.assertEqual(f.failManager.getFailTotal(), 1)
+		# the residual buffer belongs to the new file only (dangling "end"):
+		self.assertEqual(
+			["".join(t) for t in f.getLogState(p).lineBuffer],
+			["Aug 14 11:59:10 end"])
+
+	def testDelLogPathResetsPositionAndState(self):
+		# Removing a file drops its counters/state and its persisted read
+		# position; re-adding starts reading from the new beginning.
+		db = Fail2BanDb(':memory:')
+		f, jail, p1, p2 = self._multiFileSetup(db)
+		f.setMaxLines(3)
+		f.setMaxRetry(1)
+		f.addFailRegex(r"^.*start from <HOST>$<SKIPLINES>^.*end$")
+		self._writeLines(p1, [
+			"Aug 14 11:59:58 start from 192.0.2.31",
+			"Aug 14 11:59:59 end"])
+		self._writeLines(p2, [
+			"Aug 14 11:58:58 start from 192.0.2.32",
+			"Aug 14 11:58:59 end"])
+		f.getFailures(p1); f.getFailures(p2)
+		self._popTickets(jail)
+		f._updateDBPending()
+		self.assertTrue(f.getLog(p1).getPos() > 0)
+		self.assertEqual(f.getFileStats(p1), (2, 1))
+		self.assertIn(p1, db.getLogPaths(jail))
+		# remove p1: position row deleted, p2 position retained:
+		f.delLogPath(p1)
+		self.assertNotIn(p1, db.getLogPaths(jail))
+		self.assertIn(p2, db.getLogPaths(jail))
+		self.assertIsNone(f.getFileStats(p1))
+		self.assertEqual(f.getFileStats(p2), (2, 1))
+		# re-add: fresh container at position 0, whole file re-read,
+		# no inheritance of the removed offset:
+		f.addLogPath(p1, autoSeek=False)
+		self.assertEqual(f.getLog(p1).getPos(), 0)
+		f.getFailures(p1)
+		# initial read found one failure per file (2), re-read of p1
+		# adds exactly one more (not two - p2 is unaffected):
+		self.assertEqual(f.failManager.getFailTotal(), 3)
+		tickets = self._popTickets(jail)
+		self.assertEqual([str(t.getID()) for t in tickets], ["192.0.2.31"])
+		self.assertEqual(f.getFileStats(p1), (2, 1))
+
+	def testAfterStopKeepsPerFilePositions(self):
+		# Stop flushes each file's own position, so a restart resumes
+		# every file independently at its own offset.
+		db = Fail2BanDb(':memory:')
+		f, jail, p1, p2 = self._multiFileSetup(db)
+		f.addFailRegex(r"^.*failure from <HOST>$")
+		self._writeLines(p1, ["Aug 14 11:59:59 failure from 192.0.2.41"])
+		self._writeLines(p2, [
+			"Aug 14 11:58:58 failure from 192.0.2.42",
+			"Aug 14 11:58:59 failure from 192.0.2.42"])
+		f.getFailures(p1); f.getFailures(p2)
+		f.active = False
+		f.afterStop()
+		rows = dict(db._db.execute("SELECT path, lastfilepos FROM logs").fetchall())
+		self.assertEqual(rows[p1], os.path.getsize(p1))
+		self.assertEqual(rows[p2], os.path.getsize(p2))
 
 
 class DNSUtilsTests(unittest.TestCase):
