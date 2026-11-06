@@ -207,17 +207,22 @@ class Server:
 			for s, sh in self.__prev_signals.items():
 				signal.signal(s, sh)
 
-		# Give observer a small chance to complete its work before exit
+		# Stop all the jails first: once the jail threads are gone no new
+		# ban/unban events can be produced, so the observer can close its
+		# queue entrance and drain the remaining events without rejecting
+		# valid events that should survive the restart:
+		self.stopAllJail()
+
+		# Give observer a chance to complete its work before exit.
+		# stop() closes the entrance first, then drains up to 5 seconds;
+		# events that cannot be persisted are logged with their ticket ids.
 		obsMain = Observers.Main
 		if obsMain is not None:
 			if obsMain.stop(forceQuit=False):
 				obsMain = None
 			Observers.Main = None
 
-		# Now stop all the jails
-		self.stopAllJail()
-
-		# Stop observer ultimately
+		# Stop observer ultimately (anything still pending gets accounted):
 		if obsMain is not None:
 			obsMain.stop()
 
@@ -608,12 +613,20 @@ class Server:
 		try:
 			self.__lock.acquire()
 			jails = sorted(self.__jails.items())
+			# persistence queue stats (in-memory counters, reset on restart):
+			persistence = None
+			if flavor != "stats":
+				obs = Observers.Main
+				if obs is not None and obs.active is True:
+					persistence = obs.status
 			if flavor != "stats":
 				jailList = [n for n, j in jails]
 				ret = [
 					("Number of jail", len(jailList)),
 					("Jail list", ", ".join(jailList))
 				]
+				if persistence is not None:
+					ret.append(persistence)
 			if name == '--all':
 				jstat = dict(jails)
 				for n, j in jails:

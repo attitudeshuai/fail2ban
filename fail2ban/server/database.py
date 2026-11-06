@@ -203,9 +203,12 @@ class Fail2BanDb(object):
 			cur.execute("PRAGMA foreign_keys = ON")
 			# speedup: write data through OS without syncing (no wait):
 			cur.execute("PRAGMA synchronous = OFF")
-			# speedup: transaction log in memory, alternate using OFF (disable, rollback will be impossible):
+			# rollback journal kept on disk (header zeroed), so a process
+			# killed in the middle of a write is rolled back on next open:
+			# every ban record is then either fully present or absent.
+			# pypy keeps the journal in memory to avoid sporadic table locks:
 			if not pypy:
-				cur.execute("PRAGMA journal_mode = MEMORY")
+				cur.execute("PRAGMA journal_mode = PERSIST")
 			# speedup: temporary tables and indices are kept in memory:
 			cur.execute("PRAGMA temp_store = MEMORY")
 
@@ -564,7 +567,7 @@ class Fail2BanDb(object):
 		self._updateLog(cur, jail, name, time, iso); # no hash, just time as iso
 
 	@commitandrollback
-	def addBan(self, cur, jail, ticket):
+	def addBan(self, cur, jail, ticket, replace=False):
 		"""Add a ban to the database.
 
 		Parameters
@@ -573,6 +576,13 @@ class Fail2BanDb(object):
 			Jail in which the ban has occurred.
 		ticket : BanTicket
 			Ticket of the ban to be added.
+		replace : bool
+			Must be True only when the caller retries a write whose
+			commit result is uncertain (the asynchronous persistence
+			queue). The whole call stays a single transaction, so a
+			retried ticket can leave exactly one record and can never
+			produce a duplicate ban; normal callers keep the historical
+			"append a new ban episode" behavior.
 		"""
 		ip = str(ticket.getID())
 		try:
@@ -593,13 +603,22 @@ class Fail2BanDb(object):
 		elif matches:
 			data = data.copy()
 			del data['matches']
+		timeofban = int(round(ticket.getTime()))
+		bantime = ticket.getBanTime(jail.actions.getBanTime())
+		bancount = ticket.getBanCount()
+		if replace:
+			# idempotent retry: drop a row that could have been committed
+			# by the previous uncertain attempt (same ban episode only):
+			cur.execute(
+				"DELETE FROM bans WHERE jail=? AND ip=? AND timeofban=?",
+				(jail.name, ip, timeofban))
 		cur.execute(
 			"INSERT INTO bans(jail, ip, timeofban, bantime, bancount, data) VALUES(?, ?, ?, ?, ?, ?)",
-			(jail.name, ip, int(round(ticket.getTime())), ticket.getBanTime(jail.actions.getBanTime()), ticket.getBanCount(),
+			(jail.name, ip, timeofban, bantime, bancount,
 				data))
 		cur.execute(
 			"INSERT OR REPLACE INTO bips(ip, jail, timeofban, bantime, bancount, data) VALUES(?, ?, ?, ?, ?, ?)",
-			(ip, jail.name, int(round(ticket.getTime())), ticket.getBanTime(jail.actions.getBanTime()), ticket.getBanCount(),
+			(ip, jail.name, timeofban, bantime, bancount,
 				data))
 
 	@commitandrollback

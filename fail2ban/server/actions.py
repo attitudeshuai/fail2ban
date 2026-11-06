@@ -275,9 +275,19 @@ class Actions(JailThread, Mapping):
 				raise ValueError("not banned: %r" % missed)
 			return cnt
 		# Single IP:
-		# Always delete ip from database (also if currently not banned)
+		# Always delete ip from database (also if currently not banned).
+		# Goes through the observer queue so ban/unban of the same ticket are
+		# ordered and coalesced (last state wins); wait briefly for the delete
+		# to be applied since this is a control operation, never the ban main
+		# loop. Fall back to a synchronous write if no observer is running.
 		if db and self._jail.database is not None:
-			self._jail.database.delBan(self._jail, ip)
+			obs = Observers.Main
+			if obs is not None and obs.active is True:
+				ev = obs.add('banRemoved', self._jail, ip)
+				if ev is not None:
+					ev.wait_done(obs.PRODUCER_WAIT_TIME)
+			else:
+				self._jail.database.delBan(self._jail, ip)
 		# Find the ticket with the IP.
 		ticket = self.banManager.getTicketByID(ip)
 		if ticket is not None:
@@ -677,7 +687,15 @@ class Actions(JailThread, Mapping):
 		# flush the database also:
 		if db and self._jail.database is not None:
 			logSys.debug("  Flush jail in database")
-			self._jail.database.delBan(self._jail)
+			# ordered through the observer queue (collapses pending bans of
+			# this jail, last state wins); synchronous if no observer runs:
+			obs = Observers.Main
+			if obs is not None and obs.active is True:
+				ev = obs.add('jailFlushed', self._jail)
+				if ev is not None:
+					ev.wait_done(obs.PRODUCER_WAIT_TIME)
+			else:
+				self._jail.database.delBan(self._jail)
 		# unban each ticket with non-flusheable actions:
 		for ticket in lst:
 			# unban ip:

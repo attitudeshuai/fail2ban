@@ -454,6 +454,7 @@ def gatherTests(regexps=None, opts=None):
 	tests.addTest(loadTests(observertestcase.ObserverTest))
 	tests.addTest(loadTests(observertestcase.BanTimeIncr))
 	tests.addTest(loadTests(observertestcase.BanTimeIncrDB))
+	tests.addTest(loadTests(observertestcase.PersistenceQueueTest))
 
 	# Filter
 	tests.addTest(loadTests(filtertestcase.IgnoreIP))

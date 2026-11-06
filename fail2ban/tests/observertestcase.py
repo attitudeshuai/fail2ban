@@ -28,7 +28,9 @@ import os
 import sys
 import unittest
 import tempfile
+import threading
 import time
+import sqlite3
 
 from ..server.mytime import MyTime
 from ..server.ticket import FailTicket, BanTicket
@@ -632,3 +634,429 @@ class ObserverTest(LogCaptureTestCase):
 		self.assertEqual(len(x), 1)
 		self.assertEqual(x[0][0], RuntimeError)
 		self.assertEqual(str(x[0][1]), 'run bad thread exception')
+
+
+class PersistenceQueueTest(LogCaptureTestCase):
+	"""Acceptance tests for the bounded, coalescing, retrying persistence queue.
+
+	Covers: normal shutdown drain, persistent write failure (bounded retry
+	and give-up accounting), queue saturation (merge/drop/non-blocking
+	producer/closed entrance) and forced termination (no half record,
+	database still readable, committed records not rolled back).
+	"""
+
+	def setUp(self):
+		super(PersistenceQueueTest, self).setUp()
+		if Fail2BanDb is None: # pragma: no cover
+			raise unittest.SkipTest(
+				"Unable to import fail2ban database module as sqlite is not "
+				"available.")
+		_, self.dbFilename = tempfile.mkstemp(".db", "fail2ban_pq_")
+		self.db = Fail2BanDb(self.dbFilename)
+		self.jail = DummyJail(backend='polling')
+		self.jail.database = self.db
+		self.db.addJail(self.jail)
+		self.jail.actions.setBanTime(600)
+		self.obs = ObserverThread()
+		# keep retry backoff fast and bounded in tests:
+		self.obs._retry_interval = 0.01
+		self.obs._retry_max_interval = 0.05
+		self.obs._retry_max_attempts = 3
+		self.obs.start()
+		Observers.Main = self.obs
+		self.obs.add('nop')
+		self.obs.wait_empty(2)
+
+	def tearDown(self):
+		try:
+			self.obs.stop()
+		except Exception:
+			pass
+		Observers.Main = None
+		try:
+			self.db.close()
+		except Exception:
+			pass
+		if os.path.isfile(self.dbFilename):
+			os.remove(self.dbFilename)
+		super(PersistenceQueueTest, self).tearDown()
+
+	def _ban(self, ip):
+		ticket = BanTicket(ip, int(MyTime.time()))
+		ticket.incrBanCount()
+		return ticket, self.obs.add('banFound', ticket, self.jail, 600)
+
+	def _stat(self):
+		_ , items = self.obs.status
+		return dict(s.split('=', 1) for s in items)
+
+	def _currentBans(self, db=None):
+		db = db or self.db
+		return db.getCurrentBans(jail=self.jail,
+			fromtime=int(MyTime.time()) - 3600, correctBanTime=False)
+
+	def testNormalShutdownDrainAndBanUnbanCoalesce(self):
+		# 1) every ban gets persisted and is there after restart:
+		ips = ['192.0.2.%d' % i for i in range(1, 6)]
+		for ip in ips:
+			self._ban(ip)
+		self.obs.wait_empty(5)
+		self.assertEqual(sorted(str(t.getID()) for t in self._currentBans()),
+			sorted(ips))
+		self.assertEqual(int(self._stat()['merged']), 0)
+		self.assertEqual(int(self._stat()['dropped']), 0)
+
+		# 2) ban and unban of the same ticket, both pending, collapse to no-op:
+		self.obs.paused = True
+		try:
+			_ , evadd = self._ban('192.0.2.21')
+			evrm = self.obs.add('banRemoved', self.jail, '192.0.2.21')
+			self.assertTrue(evrm.cancelled)
+			self.assertEqual(int(self._stat()['merged']), 1)
+		finally:
+			self.obs.paused = False
+		evrm.wait_done(2)
+		self.obs.wait_empty(5)
+		self.assertEqual(self.db.getBans(jail=self.jail, ip='192.0.2.21'), [])
+
+		# 3) committed ban followed by unban - final state absent:
+		_ , evadd = self._ban('192.0.2.22')
+		self.obs.wait_empty(2)
+		evrm = self.obs.add('banRemoved', self.jail, '192.0.2.22')
+		self.assertTrue(evrm.wait_done(5))
+		self.assertEqual(self.db.getBans(jail=self.jail, ip='192.0.2.22'), [])
+
+		# 4) graceful stop drains the queue; reopen as after a restart:
+		self.assertTrue(self.obs.stop(forceQuit=False))
+		db2 = Fail2BanDb(self.dbFilename)
+		try:
+			self.assertEqual(
+				sorted(str(t.getID()) for t in self._currentBans(db2)),
+				sorted(ips))
+		finally:
+			db2.close()
+
+	def testPersistentWriteFailureRetriesAndGiveUp(self):
+		# slow enough backoff so the "retrying" state is observable:
+		self.obs._retry_interval = 0.25
+		self.obs._retry_max_interval = 1.0
+		self.obs._retry_max_attempts = 3
+		# all writes keep failing:
+		def fail_add(jail, ticket, replace=False):
+			raise sqlite3.OperationalError('simulated disk failure')
+		self.db.addBan = fail_add
+		try:
+			ticket = BanTicket('192.0.2.31', int(MyTime.time()))
+			ticket.incrBanCount()
+			self.obs.add('banFound', ticket, self.jail, 600)
+			# current retry count is visible while retrying:
+			self.assertTrue(Utils.wait_for(
+				lambda: int(self._stat()['retrying']) >= 1, 5))
+			# bounded retries, then the ticket is given up (loud, counted):
+			self.assertLogged('give up persisting ban:DummyJail:192.0.2.31',
+				wait=True)
+			self.assertTrue(Utils.wait_for(
+				lambda: int(self._stat()['dropped']) >= 1, 5))
+			self.assertEqual(self.db.getBans(jail=self.jail), [])
+		finally:
+			del self.db.addBan
+
+		# database recovered - following events are written again:
+		self._ban('192.0.2.32')
+		self.obs.wait_empty(5)
+		self.assertEqual(
+			sorted(str(t.getID()) for t in self._currentBans()),
+			['192.0.2.32'])
+
+		# counters reset on restart (fresh observer):
+		self.obs.stop(forceQuit=False)
+		obs2 = ObserverThread()
+		obs2.start()
+		try:
+			try:
+				_ , items = obs2.status
+				st = dict(s.split('=', 1) for s in items)
+				self.assertEqual(st['merged'], '0')
+				self.assertEqual(st['dropped'], '0')
+				self.assertEqual(st['retrying'], '0')
+			finally:
+				obs2.stop()
+		finally:
+			pass
+
+	def testQueueFullMergesDropsAndNeverBlocksProducer(self):
+		self.obs._queue_limit = 4
+		self.obs.paused = True
+		try:
+			begin = time.time()
+			# four distinct tickets are accepted:
+			for i in range(1, 5):
+				_ , ev = self._ban('192.0.2.1%d' % i)
+				self.assertIsNotNone(ev)
+			# fifth distinct ticket - rejected immediately, counted:
+			ticket = BanTicket('192.0.2.99', int(MyTime.time()))
+			ticket.incrBanCount()
+			self.assertIsNone(self.obs.add('banFound', ticket, self.jail, 600))
+			self.assertLess(time.time() - begin, 1.0)
+			self.assertEqual(int(self._stat()['dropped']), 1)
+			# another state of an already queued ticket - merged:
+			_ , ev = self._ban('192.0.2.11')
+			self.assertIsNotNone(ev)
+			self.assertEqual(int(self._stat()['merged']), 1)
+		finally:
+			self.obs.paused = False
+		self.obs.wait_empty(5)
+		self.assertEqual(int(self._stat()['dropped']), 1)
+
+	def testFailureEventsStayDistinctBelowCapacity(self):
+		# below the limit repeated failure events for one ticket are kept
+		# distinct (their accumulation changes the retry count):
+		self.obs._queue_limit = 10
+		self.obs.paused = True
+		try:
+			f1 = FailTicket('192.0.2.77', MyTime.time())
+			f2 = FailTicket('192.0.2.77', MyTime.time())
+			e1 = self.obs.add('failureFound', self.jail, f1)
+			e2 = self.obs.add('failureFound', self.jail, f2)
+			self.assertIsNotNone(e1)
+			self.assertIsNotNone(e2)
+			self.assertIsNot(e1, e2)
+			self.assertEqual(int(self._stat()['queue']), 2)
+			self.assertEqual(int(self._stat()['merged']), 0)
+		finally:
+			self.obs.paused = False
+		self.obs.wait_empty(5)
+
+	def testFailureEventsCoalesceWhenSaturated(self):
+		self.obs._queue_limit = 3
+		self.obs.paused = True
+		try:
+			accepted = []
+			for ip in ('192.0.2.81', '192.0.2.82', '192.0.2.83'):
+				e = self.obs.add('failureFound', self.jail,
+					FailTicket(ip, MyTime.time()))
+				self.assertIsNotNone(e)
+				accepted.append(e)
+			# same ticket as a queued failure - merged (no extra slot):
+			e = self.obs.add('failureFound', self.jail,
+				FailTicket('192.0.2.82', MyTime.time()))
+			self.assertIs(e, accepted[1])
+			self.assertEqual(int(self._stat()['merged']), 1)
+			# another distinct failure - dropped:
+			self.assertIsNone(self.obs.add('failureFound', self.jail,
+				FailTicket('192.0.2.84', MyTime.time())))
+			self.assertEqual(int(self._stat()['dropped']), 1)
+		finally:
+			self.obs.paused = False
+		self.obs.wait_empty(5)
+
+	def testDrainRejectsNewEventsAndLogsLeftovers(self):
+		# make one ticket impossible to persist within the drain window:
+		def fail_add(jail, ticket, replace=False):
+			raise sqlite3.OperationalError('simulated disk failure')
+		self.db.addBan = fail_add
+		self.obs.paused = True
+		try:
+			ticket = BanTicket('192.0.2.88', int(MyTime.time()))
+			ticket.incrBanCount()
+			self.obs.add('banFound', ticket, self.jail, 600)
+		finally:
+			self.obs.paused = False
+		# first shutdown phase closes entrance but can't drain in 0.05s:
+		self.assertFalse(self.obs.stop(wtime=0.05, forceQuit=False))
+		# events arriving during drain are rejected and counted:
+		ticket = BanTicket('192.0.2.89', int(MyTime.time()))
+		ticket.incrBanCount()
+		self.assertIsNone(self.obs.add('banFound', ticket, self.jail, 600))
+		# force after the wait cap - leftovers logged with ticket id,
+		# never silently cleared:
+		self.obs.stop(wtime=0.05, forceQuit=True)
+		self.assertLogged('not persisted and discarded',
+			'ban:DummyJail:192.0.2.88', all=True)
+		dropped = int(self._stat()['dropped'])
+		self.assertGreaterEqual(dropped, 2) # unpersisted ticket + rejected one
+		del self.db.addBan
+
+	def testRetryPreservesOrderAndNoDuplicates(self):
+		order = []
+		real_add = self.db.addBan
+		started = threading.Event()
+		release = threading.Event()
+		def flaky(jail, ticket, replace=False):
+			if str(ticket.getID()) == '192.0.2.41':
+				if not started.is_set():
+					started.set()
+					raise sqlite3.OperationalError('simulated transient failure')
+				# hold back the retried ticket while later ones queue up:
+				self.assertTrue(release.wait(5))
+			order.append(str(ticket.getID()))
+			return real_add(jail, ticket, replace)
+		self.db.addBan = flaky
+		try:
+			for ip in ('192.0.2.41', '192.0.2.42', '192.0.2.43'):
+				ticket = BanTicket(ip, int(MyTime.time()))
+				ticket.incrBanCount()
+				self.obs.add('banFound', ticket, self.jail, 600)
+			# first attempt failed, ticket is being retried (queue head):
+			self.assertTrue(started.wait(5))
+			self.assertTrue(Utils.wait_for(
+				lambda: self.obs._inflight is not None
+					and self.obs._inflight.attempts > 0, 5))
+			# let the queue continue:
+			release.set()
+			self.obs.wait_empty(5)
+		finally:
+			release.set()
+			del self.db.addBan
+		# later tickets must not overtake the ticket being retried:
+		self.assertEqual(order, ['192.0.2.41', '192.0.2.42', '192.0.2.43'])
+		self.assertLogged('retry 1/3')
+		# exactly one record per ticket after the retry:
+		for ip in order:
+			self.assertEqual(len(self.db.getBans(jail=self.jail, ip=ip)), 1)
+
+	def testFlushCollapsesPendingBansButKeepsLaterOnes(self):
+		self.obs.paused = True
+		try:
+			# two bans queued, then a whole-jail flush, then a new ban:
+			self._ban('192.0.2.91')
+			self._ban('192.0.2.92')
+			evflush = self.obs.add('jailFlushed', self.jail)
+			self.assertIsNotNone(evflush)
+			self._ban('192.0.2.93')
+			# the two earlier bans collapsed into the flush:
+			self.assertGreaterEqual(int(self._stat()['merged']), 2)
+		finally:
+			self.obs.paused = False
+		self.obs.wait_empty(5)
+		# final state: only the ban after the flush is present:
+		self.assertEqual(
+			sorted(str(t.getID()) for t in self._currentBans()),
+			['192.0.2.93'])
+
+	def testBanUnbanLastStateWinsDuringRetry(self):
+		real_add = self.db.addBan
+		started = threading.Event()
+		release = threading.Event()
+		def flaky(jail, ticket, replace=False):
+			if str(ticket.getID()) == '192.0.2.51':
+				if not started.is_set():
+					started.set()
+					raise sqlite3.OperationalError('simulated transient failure')
+				# keep the add pending while the unban event arrives:
+				self.assertTrue(release.wait(5))
+			return real_add(jail, ticket, replace)
+		self.db.addBan = flaky
+		try:
+			ticket = BanTicket('192.0.2.51', int(MyTime.time()))
+			ticket.incrBanCount()
+			self.obs.add('banFound', ticket, self.jail, 600)
+			# wait until the write is being retried, then unban same ticket:
+			self.assertTrue(started.wait(5))
+			self.assertTrue(Utils.wait_for(
+				lambda: self.obs._inflight is not None
+					and str(self.obs._inflight[1].getID()) == '192.0.2.51'
+					and self.obs._inflight.attempts > 0, 5))
+			evrm = self.obs.add('banRemoved', self.jail, '192.0.2.51')
+			self.assertIsNotNone(evrm)
+			# merge changes the desired state, merged counter increased:
+			self.assertEqual(int(self._stat()['merged']), 1)
+			release.set()
+			self.obs.wait_empty(5)
+			# final state is unbanned, no intermediate ban left:
+			self.assertEqual(self.db.getBans(jail=self.jail, ip='192.0.2.51'), [])
+			self.assertEqual(self._currentBans(), [])
+		finally:
+			release.set()
+			del self.db.addBan
+		# banned again later - exactly one record for the new episode:
+		ticket = BanTicket('192.0.2.51', int(MyTime.time()))
+		ticket.incrBanCount()
+		self.obs.add('banFound', ticket, self.jail, 600)
+		self.obs.wait_empty(5)
+		self.assertEqual(len(self.db.getBans(jail=self.jail, ip='192.0.2.51')), 1)
+
+	def testForceStopKeepsDatabaseReadableAndCommittedRecords(self):
+		# one healthy, committed ban:
+		self._ban('192.0.2.71')
+		self.obs.wait_empty(2)
+		# then writes start failing:
+		def fail_add(jail, ticket, replace=False):
+			raise sqlite3.OperationalError('simulated disk failure')
+		self.db.addBan = fail_add
+		self.obs.paused = True
+		try:
+			ticket = BanTicket('192.0.2.72', int(MyTime.time()))
+			ticket.incrBanCount()
+			self.obs.add('banFound', ticket, self.jail, 600)
+		finally:
+			self.obs.paused = False
+		# force the shutdown quickly:
+		self.obs.stop(wtime=0.05, forceQuit=True)
+		self.assertLogged('not persisted and discarded',
+			'ban:DummyJail:192.0.2.72', all=True)
+		del self.db.addBan
+		# database is still readable, committed record kept, no rollback:
+		db2 = Fail2BanDb(self.dbFilename)
+		try:
+			self.assertEqual(
+				sorted(str(t.getID()) for t in self._currentBans(db2)),
+				['192.0.2.71'])
+		finally:
+			db2.close()
+
+	def testNoHalfRecordAndIdempotentRetryWrite(self):
+		db = self.db
+		# rollback journal is kept on disk, so a killed process leaves no
+		# half-written record:
+		cur = db._db.cursor()
+		cur.execute("PRAGMA journal_mode")
+		self.assertEqual(str(cur.fetchone()[0]).lower(), 'persist')
+		cur.close()
+		# fault injection: fail the second statement (bips) of addBan,
+		# which is one transaction - the first statement must roll back:
+		real_conn = db._db
+		class BadCur(object):
+			def __init__(self, c):
+				self._c = c
+			def execute(self, sql, *args):
+				if 'INTO bips' in sql:
+					raise sqlite3.OperationalError(
+						'simulated crash during bips write')
+				return self._c.execute(sql, *args)
+			def close(self):
+				return self._c.close()
+		class BadConn(object):
+			def __init__(self, c):
+				self._c = c
+			def cursor(self, *a, **k):
+				return BadCur(self._c.cursor(*a, **k))
+			def __enter__(self):
+				return self._c.__enter__()
+			def __exit__(self, *a):
+				return self._c.__exit__(*a)
+			def __getattr__(self, name):
+				return getattr(self._c, name)
+		db._db = BadConn(real_conn)
+		ticket = BanTicket('192.0.2.61', int(MyTime.time()))
+		ticket.incrBanCount()
+		try:
+			self.assertRaises(sqlite3.Error, db.addBan, self.jail, ticket)
+		finally:
+			db._db = real_conn
+		# nothing half-written is readable:
+		self.assertEqual(db.getBans(jail=self.jail, ip='192.0.2.61'), [])
+		self.assertEqual(
+			[str(t.getID()) for t in self._currentBans()], [])
+		# retried (idempotent) write - exactly one complete record:
+		db.addBan(self.jail, ticket, True)
+		self.assertEqual(len(db.getBans(jail=self.jail, ip='192.0.2.61')), 1)
+		self.assertEqual(len(self._currentBans()), 1)
+		# repeating the same uncertain retry still yields one record:
+		db.addBan(self.jail, ticket, True)
+		self.assertEqual(len(db.getBans(jail=self.jail, ip='192.0.2.61')), 1)
+		# a new ban episode of the same ip keeps a distinct history row:
+		ticket2 = BanTicket('192.0.2.61', int(MyTime.time()) + 1)
+		ticket2.incrBanCount()
+		db.addBan(self.jail, ticket2)
+		self.assertEqual(len(db.getBans(jail=self.jail, ip='192.0.2.61')), 2)
