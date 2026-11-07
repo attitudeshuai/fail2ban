@@ -94,6 +94,8 @@ class Filter(JailThread):
 		## Store last time stamp, applicable for multi-line
 		self.__lastTimeText = ""
 		self.__lastDate = None
+		## Time of the line currently/last processed (checkpoint for file backends)
+		self._lastLineTime = None
 		## Next service (cleanup) time
 		self.__nextSvcTime = -(1<<63)
 		## if set, treat log lines without explicit time zone to be in this time zone
@@ -680,6 +682,9 @@ class Filter(JailThread):
 				elif self.checkFindTime and self.inOperation:
 					date = MyTime.time()
 		
+		# save resolved entry time (used by file backends as the checkpoint time,
+		# does not change date parsing/matching behavior):
+		self._lastLineTime = date
 		if self.checkFindTime and date is not None:
 			# if in operation (modifications have been really found):
 			if self.inOperation:
@@ -717,7 +722,11 @@ class Filter(JailThread):
 
 	def processLineAndAdd(self, line, date=None):
 		"""Processes the line for failures and populates failManager
+
+		Returns the resolved time of the processed entry (or `None` if it
+		could not be parsed); used by file backends to advance checkpoints.
 		"""
+		entryTime = None
 		try:
 			for (_, ip, unixTime, fail) in self.processLine(line, date):
 				logSys.debug("Processing line with time:%s and ip:%s", 
@@ -739,6 +748,7 @@ class Filter(JailThread):
 				# report to observer - failure was found, for possibly increasing of it retry counter (asynchronous)
 				if Observers.Main is not None:
 					Observers.Main.add('failureFound', self.jail, tick)
+			entryTime = self._lastLineTime
 			self.procLines += 1
 			# every 100 lines check need to perform service tasks:
 			if self.procLines % 100 == 0:
@@ -751,6 +761,7 @@ class Filter(JailThread):
 				exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
 			# incr common error counter:
 			self.commonError()
+		return entryTime
 
 	def commonError(self, reason="common", exc=None):
 		# incr error counter, stop processing (going idle) after 100th error :
@@ -1009,6 +1020,8 @@ class FileFilter(Filter):
 		## The log file path.
 		self.__logs = dict()
 		self.__autoSeek = dict()
+		## Log paths awaiting identity-based resume after restart/reopen:
+		self.__resume = dict()
 
 	##
 	# Add a log file path
@@ -1026,11 +1039,30 @@ class FileFilter(Filter):
 			db = self.jail.database
 			if db is not None:
 				lastpos = db.addLog(self.jail, log)
-				if lastpos and not tail:
-					log.setPos(lastpos)
+				cp = None
+				try:
+					cp = db.getLogResume(self.jail, path)
+				except Exception as e: # pragma: no cover - defensive
+					logSys.error("Failed to read resume checkpoint for %r: %r", path, e)
+				if cp and not tail:
+					if lastpos:
+						log.setPos(lastpos)
+					# pending gap from a previous run/reload (reported once,
+					# retained until the next successful resume):
+					if cp.get('gap'):
+						gap = cp['gap']
+						if gap[0] or gap[1]:
+							log.setGap(gap[0], gap[1], gap[2])
+							# do not drop the gap before a genuinely new entry
+							# beyond what was already known at report time:
+							log.setGapKeepUntil(max(gap[1], cp.get('time') or 0))
+					# identity checkpoint available - arm reconciliation and
+					# skip the plain time-based auto seek for this file:
+					if log.setResume(cp.get('time'), cp.get('id')):
+						self.__resume[path] = 1
 			self.__logs[path] = log
 			logSys.info("Added logfile: %r (pos = %s, hash = %s)" , path, log.getPos(), log.getHash())
-			if autoSeek and not tail:
+			if autoSeek and not tail and path not in self.__resume:
 				self.__autoSeek[path] = autoSeek
 			self._addLogPath(path)			# backend specific
 
@@ -1049,6 +1081,8 @@ class FileFilter(Filter):
 			log = self.__logs.pop(path)
 		except KeyError:
 			return
+		self.__resume.pop(path, None)
+		self.__autoSeek.pop(path, None)
 		logSys.info("Removed logfile: %r", path)
 		self._delLogPath(path)
 		return
@@ -1155,6 +1189,24 @@ class FileFilter(Filter):
 						return False
 
 			if has_content:
+				# identity-based resume after restart/reopen - anchor at the
+				# checkpoint time searching from the (possibly rotated) log
+				# start, then skip through the stored entry identity:
+				resuming = filename in self.__resume and log.resumeActive()
+				if resuming and log.resumeNeedsAnchor():
+					if log.wasRotated():
+						# new file generation while still resuming - rescan
+						# from the new log start aligned at checkpoint time:
+						log.rewindResume()
+					try:
+						log.setPos(0)
+						self.seekToTime(log, log.resumeTime())
+						log.markResumeAnchored()
+					except Exception as e: # pragma: no cover
+						logSys.error("Error during resume seek in \"%s\": %r", filename, e)
+						self.__resume.pop(filename, None)
+						log.setResume(0, None)
+						resuming = False
 				while not self.idle:
 					line = log.readline()
 					if not self.active: break; # jail has been stopped
@@ -1165,7 +1217,24 @@ class FileFilter(Filter):
 						break
 					# acquire in operation from log and process:
 					self.inOperation = inOperation if inOperation is not None else log.inOperation
-					self.processLineAndAdd(line)
+					if resuming:
+						tm = self._lineTime(line)
+						process, gap = log.resumeClassify(tm, line)
+						if gap:
+							self._reportGap(log, gap)
+						if process:
+							self.processLineAndAdd(line)
+						resuming = log.resumeActive()
+						if not resuming:
+							self.__resume.pop(filename, None)
+					else:
+						tm = self.processLineAndAdd(line)
+						log.noteEntry(tm, line)
+				# keep armed if reconciliation could not conclude (e.g. EOF):
+				if log.resumeActive():
+					self.__resume[filename] = 1
+				else:
+					self.__resume.pop(filename, None)
 		finally:
 			log.close()
 		if self.jail.database is not None:
@@ -1177,6 +1246,10 @@ class FileFilter(Filter):
 			):
 				self._updateDBPending()
 				self._nextUpdateTM = MyTime.time() + Utils.DEFAULT_SLEEP_TIME * 5
+		# a gap reported this cycle stays at least until the next read
+		# cycle (next successful continuation):
+		log.snapshotGapProgress()
+		log.clearGapNew()
 		return True
 
 	##
@@ -1270,6 +1343,53 @@ class FileFilter(Filter):
 			logSys.debug("Position %s from %s, found time %s (%s) within %s seeks", lastPos, fs, foundTime, 
 				(MyTime.time2str(foundTime) if foundTime is not None else ''), cntr)
 		
+	def _lineTime(self, line):
+		"""Parse only the entry time of a line (read-only; used by the
+		identity resume scan, which typically covers just a same-second
+		group of lines)."""
+		dd = self.dateDetector
+		if dd is None:
+			return None
+		try:
+			timeMatch = dd.matchTime(line)
+			m = timeMatch[0]
+			if m:
+				tm = dd.getTime(line[m.start(1):m.end(1)], timeMatch)
+				if tm is not None:
+					return tm[0]
+		except Exception as e:
+			logSys.log(7, "Resume scan: failed to parse time of %r: %r", line, e)
+		return None
+
+	def _reportGap(self, log, gap):
+		"""Record and report a missing log interval exactly once.
+
+		The same (start, end) gap is never logged twice - not on repeated
+		reads, reloads or restarts; the reported flag is persisted
+		immediately and cleared on the next successful continuation.
+		"""
+		start, end = int(gap[0]), int(gap[1])
+		prev = log.getGap()
+		if prev and prev[0] == start and prev[1] == end and prev[2]:
+			# already reported (possibly in a previous run/reload):
+			log.setGap(start, end, 1)
+			return
+		log.setGap(start, end, 1)
+		log.markGapReported()
+		logSys.warning(
+			"[%s] Log gap detected in %r: entries between %s and %s are no "
+			"longer available (log was cleared, truncated or rotated); "
+			"resuming from the first available entry",
+			self.jailName, log.getFileName(),
+			MyTime.time2str(start), MyTime.time2str(end))
+		db = self.jail.database
+		if db is not None:
+			try:
+				db.updateLogGap(self.jail, log.getFileName(), start, end, 1)
+			except Exception as e:
+				logSys.error("Failed to persist log gap for %r: %r",
+					log.getFileName(), e)
+
 	def status(self, flavor="basic"):
 		"""Status of Filter plus files being monitored.
 		"""
@@ -1278,10 +1398,31 @@ class FileFilter(Filter):
 			return ret
 		path = list(self.__logs.keys())
 		ret.append(("File list", path))
+		resume = []
+		for log in self.getLogs():
+			gap = log.getGap()
+			fails = log.getCpWriteFailures()
+			resume.append([
+				log.getFileName(), [
+					("Position", log.getPos()),
+					("Last entry time", log.getEntryTime()),
+					("Last entry id", log.getEntryId() or ""),
+					("Resuming", 1 if log.resumeActive() else 0),
+					("Gap", [gap[0], gap[1]] if gap else []),
+					("Gap reported", gap[2] if gap else 0),
+					("Checkpoint write failures", [fails[0], fails[1]]),
+				]
+			])
+		ret.append(("File resume", resume))
 		return ret
 
 	def _updateDBPending(self):
-		"""Apply pending updates (log position) to database.
+		"""Apply pending updates (log position/checkpoint) to database.
+
+		A failed write never destroys the last usable checkpoint: the
+		database transaction is rolled back, the failure is recorded and
+		the pending update is re-queued for the next batch - so a crash
+		replays at most one batch.
 		"""
 		db = self.jail.database
 		while True:
@@ -1289,7 +1430,30 @@ class FileFilter(Filter):
 				log, args = self._pendDBUpdates.popitem()
 			except KeyError:
 				break
-			db.updateLog(self.jail, log)
+			# a previously reported gap is cleared with the first checkpoint
+			# write beyond the reporting-cycle watermark on a later cycle
+			# (= retained until the next successful resume):
+			gapCleared = None
+			gap = log.getGap()
+			if (gap and not log.gapIsNew()
+				and log.getEntryTime() > max(gap[1], log.getGapKeepUntil())
+			):
+				gapCleared = gap
+				log.clearGap()
+			try:
+				db.updateLog(self.jail, log)
+			except Exception as e:
+				# transaction rolled back - restore in-memory gap state:
+				if gapCleared is not None:
+					log.setGap(gapCleared[0], gapCleared[1], gapCleared[2])
+				log.noteCpWriteFailure()
+				logSys.error(
+					"[%s] Failed to write log checkpoint for %r (%r); "
+					"keeping last known checkpoint, will retry",
+					self.jailName, log.getFileName(), e)
+				# re-queue for the next batch:
+				self._pendDBUpdates[log] = args
+				break
 			
 	def afterStop(self):
 		"""Stop monitoring of log-file(s). Invoked after run method.
@@ -1335,6 +1499,35 @@ class FileContainer:
 		self.__pos4hash = 0
 		self.__hash = ''
 		self.__hashNextTime = time.time() + 30
+		## last processed entry checkpoint: time and entry identity
+		self.__entryTime = 0
+		self.__entryId = None
+		## occurrence counters of identical entries within the same second
+		## (per file, so identity sequences are never shared between files):
+		self.__entrySeqTM = None
+		self.__entrySeq = {}
+		## one-time resume reconciliation state (after restart/reopen):
+		## None - inactive; 'scan' - checkpoint identity not seen yet;
+		## 'found' - identity seen, draining the remainder of its second
+		self.__resumeState = None
+		self.__resumeTime = 0
+		self.__resumeId = None
+		self.__resumeHashSeen = False
+		## detected gap: (start, end, reported) or None
+		self.__gap = None
+		## gap was first reported during the current read cycle (it is kept
+		## until the next successful resume, even if the same batch already
+		## reaches beyond the gap end):
+		self.__gapNew = False
+		## highest entry time already known when the gap was (last) reported;
+		## the gap is cleared only after reading something newer than that:
+		self.__gapKeepUntil = 0
+		## checkpoint write failure statistics (runtime state):
+		self.__cpWriteFails = 0
+		self.__cpWriteFailTM = 0
+		## resume bookkeeping: identity scan anchored yet? rotated on last open?
+		self.__resumeAnchored = False
+		self.__rotated = False
 		# Try to open the file. Raises an exception if an error occurred.
 		handler = open(filename, 'rb')
 		if doOpen: # fail2ban-regex only (don't need to reopen it and check for rotation)
@@ -1357,6 +1550,204 @@ class FileContainer:
 			handler.close()
 		## shows that log is in operation mode (expecting new messages only from here):
 		self.inOperation = tail
+
+	@staticmethod
+	def _entryHash(line):
+		"""Stable fingerprint of a log entry (decoded line) content."""
+		return md5sum(line.encode('utf-8', 'replace')).hexdigest()
+
+	def _advanceEntryId(self, tm, line):
+		"""Advance same-second occurrence counters; return (time, id).
+
+		Sequences are counted from the anchor of the current second, so
+		multiple records sharing one timestamp keep their original order
+		even when their contents are identical.
+		"""
+		h = self._entryHash(line)
+		tm = int(tm)
+		seq = 1
+		if self.__entrySeqTM == tm:
+			seq = self.__entrySeq.get(h, 0) + 1
+		else:
+			self.__entrySeqTM = tm
+			self.__entrySeq = {}
+		self.__entrySeq[h] = seq
+		return tm, '%s:%d' % (h, seq)
+
+	def noteEntry(self, tm, line):
+		"""Advance the checkpoint by a normally processed entry."""
+		if not tm:
+			# do not poison the checkpoint with an unparsed entry
+			return self.__entryTime, self.__entryId
+		self.__entryTime, self.__entryId = self._advanceEntryId(tm, line)
+		return self.__entryTime, self.__entryId
+
+	def setResume(self, tm, entryId):
+		"""Arm identity-based resume from a checkpoint (time, entry id).
+
+		Returns True when a valid identity checkpoint is available;
+		otherwise the caller keeps the legacy (byte position) behavior.
+		"""
+		if tm and entryId:
+			self.__resumeTime = int(tm)
+			self.__resumeId = entryId
+			self.__resumeState = 'scan'
+			self.__resumeHashSeen = False
+			self.__resumeAnchored = False
+			self.__rotated = False
+			# sequences are rebuilt from the seek anchor (first entry
+			# at/after the checkpoint time):
+			self.__entrySeqTM = None
+			self.__entrySeq = {}
+			# in-memory checkpoint starts at the loaded one and must never
+			# regress while scanning already processed predecessors:
+			self.__entryTime = int(tm)
+			self.__entryId = entryId
+			return True
+		self.__resumeState = None
+		return False
+
+	def resumeActive(self):
+		"""Whether the one-time resume reconciliation is still ongoing."""
+		return self.__resumeState is not None
+
+	def resumeTime(self):
+		return self.__resumeTime
+
+	def resumeNeedsAnchor(self):
+		"""Whether the identity scan must (re)anchor at the checkpoint time.
+
+		True before the first scan and whenever the last open detected
+		rotation/truncation (position was reset to the new log start), so
+		the resume position stays aligned with the new log content.
+		"""
+		return not self.__resumeAnchored or self.__rotated
+
+	def markResumeAnchored(self):
+		self.__resumeAnchored = True
+		self.__rotated = False
+
+	def wasRotated(self):
+		return self.__rotated
+
+	def rewindResume(self):
+		"""Restart identity scan against a new file generation.
+
+		Keeps the loaded checkpoint target but resets scan state and
+		sequence counters, so the new log content is reconciled from its
+		own start (see rotation/truncation detection in open()).
+		"""
+		if self.__resumeId:
+			self.__resumeState = 'scan'
+			self.__resumeHashSeen = False
+			self.__entrySeqTM = None
+			self.__entrySeq = {}
+			self.__entryTime = self.__resumeTime
+			self.__entryId = self.__resumeId
+
+	def resumeClassify(self, tm, line):
+		"""Classify one line during resume.
+
+		Returns a tuple ``(process, gap)``:
+		  * ``process`` - True if the line has to be processed normally,
+		    False if it was already processed and must be skipped;
+		  * ``gap`` - None or ``(start, end)`` when the checkpoint
+		    identity is absent and the first later entry was reached.
+
+		Entries at the checkpoint second are counted in read order, so a
+		checkpoint landing on a record of a same-timestamp group resumes
+		exactly after that record - no skip and no duplicate.
+		"""
+		if self.__resumeState is None:
+			return True, None
+		if not tm:
+			# a line without parseable time cannot be ordered - process
+			# it once and keep waiting for the checkpoint identity:
+			return True, None
+		tm = int(tm)
+		cpTime = self.__resumeTime
+		entryTime, entryId = self._advanceEntryId(tm, line)
+		cpHash = self.__resumeId.rsplit(':', 1)[0]
+		if entryId.rsplit(':', 1)[0] == cpHash:
+			self.__resumeHashSeen = True
+		gap = None
+		if tm < cpTime:
+			process = False
+		elif tm == cpTime:
+			if self.__resumeState == 'found':
+				# same second, records after the checkpoint identity:
+				process = True
+			elif entryId == self.__resumeId:
+				# the checkpoint record itself - do not replay it:
+				self.__resumeState = 'found'
+				process = False
+			else:
+				# earlier record of the checkpoint second - already processed:
+				process = False
+		else:
+			# passed the checkpoint second without exact identity match:
+			if self.__resumeState != 'found':
+				if not self.__resumeHashSeen:
+					# the whole checkpoint record is gone (cleared/rotated):
+					gap = (cpTime, tm)
+				# else: numbering differed but the same entry content exists,
+				# align here rather than double-count or raise a false gap
+			process = True
+			self.__resumeState = None
+		# advance the stored checkpoint only with genuinely new processing
+		# (processed successors of the identity or a later second); skipped
+		# predecessors keep the loaded checkpoint and must not regress it:
+		if process or tm > cpTime:
+			self.__entryTime, self.__entryId = entryTime, entryId
+		return process, gap
+
+	def getEntryTime(self):
+		return self.__entryTime
+
+	def getEntryId(self):
+		return self.__entryId
+
+	def getGap(self):
+		return self.__gap
+
+	def getGapKeepUntil(self):
+		return self.__gapKeepUntil
+
+	def setGap(self, start, end, reported=0):
+		self.__gap = (int(start or 0), int(end or 0), int(bool(reported)))
+
+	def setGapKeepUntil(self, tm):
+		self.__gapKeepUntil = int(tm or 0)
+
+	def snapshotGapProgress(self):
+		"""Freeze how far processing went in the reporting cycle."""
+		if self.__gap is not None and self.__gapNew:
+			self.__gapKeepUntil = max(
+				self.__gapKeepUntil, self.__entryTime, self.__gap[1])
+
+	def markGapReported(self):
+		if self.__gap is not None:
+			self.__gap = (self.__gap[0], self.__gap[1], 1)
+		self.__gapNew = True
+		self.snapshotGapProgress()
+
+	def gapIsNew(self):
+		return self.__gapNew
+
+	def clearGapNew(self):
+		self.__gapNew = False
+
+	def clearGap(self):
+		self.__gap = None
+		self.__gapNew = False
+		self.__gapKeepUntil = 0
+
+	def noteCpWriteFailure(self, tm=None):
+		self.__cpWriteFails += 1
+		self.__cpWriteFailTM = int(tm if tm is not None else time.time())
+
+	def getCpWriteFailures(self):
+		return (self.__cpWriteFails, self.__cpWriteFailTM)
 
 	def __hash__(self):
 		return hash(self.__filename)
@@ -1404,6 +1795,9 @@ class FileContainer:
 			# Stat the file before even attempting to read it
 			stats = os.fstat(h.fileno())
 			rotflg = stats.st_size < self.__pos or stats.st_ino != self.__ino
+			# rotation/truncation resets the resume anchor flag (the resume
+			# scan itself is unchanged - only recorded for the caller):
+			self.__rotated = False
 			if rotflg or not len(myHash) or time.time() > self.__hashNextTime:
 				myHash = ''
 				firstLine = h.readline()
@@ -1420,6 +1814,9 @@ class FileContainer:
 						(stats.st_size, self.__pos, stats.st_ino, self.__ino, myHash, self.__hash))
 					self.__ino = stats.st_ino
 					self.__pos = 0
+					# signal a new file generation to a pending identity resume:
+					if self.__resumeState is not None:
+						self.__rotated = True
 				self.__hash = myHash
 			# if nothing to read from file yet (empty or no new data):
 			if forcePos is not None:

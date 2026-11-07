@@ -2118,6 +2118,280 @@ class GetFailures(LogCaptureTestCase):
 		self.assertRaises(FailManagerEmpty, self.filter.failManager.toBan)
 
 
+class LogFileResume(LogCaptureTestCase):
+	"""Identity based resume, gap detection and checkpoint write handling.
+	"""
+
+	FAILREGEX = r"Failed password for .* from <HOST>"
+
+	def setUp(self):
+		LogCaptureTestCase.setUp(self)
+		setUpMyTime()
+		self.t0 = MyTime.time()
+		self.dbtmp = tempfile.mkdtemp("", "fail2ban_resume_")
+		self.name = os.path.join(self.dbtmp, "resume.log")
+		self.db = getFail2BanDb(':memory:')
+
+	def tearDown(self):
+		try:
+			if os.path.exists(self.name):
+				os.remove(self.name)
+			os.rmdir(self.dbtmp)
+		finally:
+			self.db.close()
+			tearDownMyTime()
+			LogCaptureTestCase.tearDown(self)
+
+	def _line(self, t, ip="192.0.2.10"):
+		return ("%d Failed password for root from %s port 1 ssh2\n"
+			% (t, ip)).encode('ascii')
+
+	def _write(self, *lines):
+		with open(self.name, "ab") as f:
+			for ln in lines:
+				f.write(ln)
+
+	def _filter(self, jailName="resumeJail"):
+		jail = DummyJail(name=jailName)
+		jail.database = self.db
+		self.db.addJail(jail)
+		flt = FileFilter(jail)
+		flt.active = True
+		flt.checkFindTime = False
+		flt.setDatePattern((r'^EPOCH',))
+		flt.addFailRegex(self.FAILREGEX)
+		return flt
+
+	def _resumeInfo(self, flt):
+		st = dict(flt.status())
+		for entry in st["File resume"]:
+			if entry[0] == self.name:
+				return dict(entry[1])
+		raise KeyError(self.name)
+
+	def testNormalRestartNoReplay(self):
+		t = self.t0
+		self._write(self._line(t), self._line(t + 1), self._line(t + 2))
+		flt = self._filter()
+		flt.addLogPath(self.name, autoSeek=0)
+		self.assertEqual(flt.getFailures(self.name), True)
+		self.assertEqual(flt.failManager.getFailTotal(), 3)
+		cp = self.db.getLogResume(flt.jail, self.name)
+		self.assertEqual(cp['time'], t + 2)
+		self.assertTrue(cp['id'])
+
+		# restart: the checkpoint record itself is not replayed:
+		flt2 = self._filter()
+		flt2.addLogPath(self.name, autoSeek=0)
+		flt2.getFailures(self.name)
+		self.assertEqual(flt2.failManager.getFailTotal(), 0)
+		self.assertEqual(self._resumeInfo(flt2)["Gap"], [])
+
+		# newly appended record is counted exactly once:
+		self._write(self._line(t + 3))
+		flt2.getFailures(self.name)
+		self.assertEqual(flt2.failManager.getFailTotal(), 1)
+
+		# another restart still replays nothing:
+		flt3 = self._filter()
+		flt3.addLogPath(self.name, autoSeek=0)
+		flt3.getFailures(self.name)
+		self.assertEqual(flt3.failManager.getFailTotal(), 0)
+
+	def testClearedIntervalGap(self):
+		t = self.t0
+		self._write(self._line(t), self._line(t + 1), self._line(t + 2))
+		flt = self._filter()
+		flt.addLogPath(self.name, autoSeek=0)
+		flt.getFailures(self.name)
+		self.assertEqual(flt.failManager.getFailTotal(), 3)
+
+		# log cleared/truncated, new entries start later:
+		with open(self.name, "wb") as f:
+			f.write(self._line(t + 10) + self._line(t + 11))
+
+		flt2 = self._filter()
+		flt2.addLogPath(self.name, autoSeek=0)
+		flt2.getFailures(self.name)
+		# old records not recounted, new records once:
+		self.assertEqual(flt2.failManager.getFailTotal(), 2)
+		info = self._resumeInfo(flt2)
+		self.assertEqual(info["Gap"], [t + 2, t + 10])
+		self.assertEqual(info["Gap reported"], 1)
+		self.assertLogged(
+			"Log gap detected",
+			MyTime.time2str(t + 2), MyTime.time2str(t + 10), all=True)
+
+		# re-reading the same log does not report the gap twice:
+		self.pruneLog()
+		flt2.getFailures(self.name)
+		self.assertEqual(flt2.failManager.getFailTotal(), 2)
+		self.assertNotLogged("Log gap detected")
+
+		# restart keeps the gap (reported flag persisted) and does not
+		# re-report it; counts do not change:
+		self.pruneLog()
+		flt3 = self._filter()
+		flt3.addLogPath(self.name, autoSeek=0)
+		flt3.getFailures(self.name)
+		self.assertEqual(flt3.failManager.getFailTotal(), 0)
+		self.assertNotLogged("Log gap detected")
+		self.assertEqual(self._resumeInfo(flt3)["Gap"], [t + 2, t + 10])
+
+		# gap cleared with next successful continuation beyond its end:
+		self._write(self._line(t + 12))
+		flt3.getFailures(self.name)
+		self.assertEqual(flt3.failManager.getFailTotal(), 1)
+		self.assertEqual(self._resumeInfo(flt3)["Gap"], [])
+
+	def testSameTimestampRecordsInOrder(self):
+		t = self.t0
+		ip = "192.0.2.11"
+		self._write(self._line(t, ip), self._line(t, ip))
+		flt = self._filter()
+		flt.addLogPath(self.name, autoSeek=0)
+		flt.getFailures(self.name)
+		self.assertEqual(flt.failManager.getFailTotal(), 2)
+		cp = self.db.getLogResume(flt.jail, self.name)
+		self.assertEqual(cp['time'], t)
+		self.assertTrue(cp['id'].endswith(':2'))
+
+		# third record with same timestamp + later record: no skip, no dup,
+		# original order within the shared second is preserved:
+		self._write(self._line(t, ip), self._line(t + 1, ip))
+		flt2 = self._filter()
+		flt2.addLogPath(self.name, autoSeek=0)
+		flt2.getFailures(self.name)
+		self.assertEqual(flt2.failManager.getFailTotal(), 2)
+
+		flt3 = self._filter()
+		flt3.addLogPath(self.name, autoSeek=0)
+		flt3.getFailures(self.name)
+		self.assertEqual(flt3.failManager.getFailTotal(), 0)
+
+		# checkpoint landing on the first of a same-second group: successors
+		# within that second are processed in order, exactly once:
+		with open(self.name, "wb") as f:
+			f.write(self._line(t + 20, ip))
+		a = self._filter()
+		a.addLogPath(self.name, autoSeek=0)
+		a.getFailures(self.name)
+		with open(self.name, "ab") as f:
+			f.write(self._line(t + 20, ip) + self._line(t + 20, ip)
+				+ self._line(t + 21, ip))
+		b = self._filter()
+		b.addLogPath(self.name, autoSeek=0)
+		b.getFailures(self.name)
+		self.assertEqual(b.failManager.getFailTotal(), 3)
+		c = self._filter()
+		c.addLogPath(self.name, autoSeek=0)
+		c.getFailures(self.name)
+		self.assertEqual(c.failManager.getFailTotal(), 0)
+
+	def testCheckpointWriteFailure(self):
+		t = self.t0
+		self._write(self._line(t), self._line(t + 1), self._line(t + 2))
+		flt = self._filter()
+		flt.addLogPath(self.name, autoSeek=0)
+		import sqlite3
+		orig = self.db.updateLog
+		self.db.updateLog = lambda *a, **k: (_ for _ in ()).throw(
+			sqlite3.OperationalError("mock disk full"))
+		flt.getFailures(self.name)
+		info = self._resumeInfo(flt)
+		self.assertEqual(info["Checkpoint write failures"][0], 1)
+		self.assertGreater(info["Checkpoint write failures"][1], 0)
+		# last usable checkpoint remains in database:
+		cp = self.db.getLogResume(flt.jail, self.name)
+		self.assertEqual(cp['time'], 0)
+		self.assertIsNone(cp['id'])
+
+		# write restored - pending checkpoint is retried and advanced:
+		self.db.updateLog = orig
+		self._write(self._line(t + 3))
+		flt.getFailures(self.name)
+		cp = self.db.getLogResume(flt.jail, self.name)
+		self.assertEqual(cp['time'], t + 3)
+		self.assertTrue(cp['id'])
+		self.assertEqual(self._resumeInfo(flt)["Checkpoint write failures"][0], 1)
+
+		# crash before a successful write: the unflushed batch replays once:
+		self.db.updateLog = lambda *a, **k: (_ for _ in ()).throw(
+			sqlite3.OperationalError("mock disk full"))
+		self._write(self._line(t + 4), self._line(t + 5))
+		flt.getFailures(self.name)
+		self.db.updateLog = orig
+		flt2 = self._filter()
+		flt2.addLogPath(self.name, autoSeek=0)
+		flt2.getFailures(self.name)
+		self.assertEqual(flt2.failManager.getFailTotal(), 2)
+		flt3 = self._filter()
+		flt3.addLogPath(self.name, autoSeek=0)
+		flt3.getFailures(self.name)
+		self.assertEqual(flt3.failManager.getFailTotal(), 0)
+
+	def testNoDatabaseStartsAtCurrentTime(self):
+		# same behavior as before without a persistent database:
+		t = MyTime.time()
+		self._write(self._line(t), self._line(t))
+		jail = DummyJail(name="resumeNoDb")
+		flt = FileFilter(jail)
+		flt.active = True
+		flt.setDatePattern((r'^EPOCH',))
+		flt.addFailRegex(self.FAILREGEX)
+		flt.addLogPath(self.name)  # default autoSeek (current time - findtime)
+		flt.getFailures(self.name)
+		self.assertEqual(flt.failManager.getFailTotal(), 2)
+		info = self._resumeInfo(flt)
+		self.assertEqual(info["Gap"], [])
+		self.assertEqual(info["Checkpoint write failures"], [0, 0])
+
+	def testMultipleFilesIndependentCheckpoints(self):
+		t = self.t0
+		name2 = os.path.join(self.dbtmp, "resume2.log")
+		try:
+			with open(self.name, "wb") as f:
+				f.write(self._line(t, "192.0.2.1"))
+			with open(name2, "wb") as f:
+				f.write(b"".join(self._line(t, "192.0.2.2") for _ in range(3)))
+			flt = self._filter()
+			flt.addLogPath(self.name, autoSeek=0)
+			flt.addLogPath(name2, autoSeek=0)
+			flt.getFailures(self.name)
+			flt.getFailures(name2)
+			cp1 = self.db.getLogResume(flt.jail, self.name)
+			cp2 = self.db.getLogResume(flt.jail, name2)
+			self.assertTrue(cp1['id'].endswith(':1'))
+			self.assertTrue(cp2['id'].endswith(':3'))
+			# restart: neither file replays, sequences do not collide:
+			flt2 = self._filter()
+			flt2.addLogPath(self.name, autoSeek=0)
+			flt2.addLogPath(name2, autoSeek=0)
+			flt2.getFailures(self.name)
+			flt2.getFailures(name2)
+			self.assertEqual(flt2.failManager.getFailTotal(), 0)
+		finally:
+			if os.path.exists(name2):
+				os.remove(name2)
+
+	def testMultipleJailsSameLogIndependent(self):
+		t = self.t0
+		self._write(self._line(t))
+		ja = self._filter("resumeJailA")
+		ja.addLogPath(self.name, autoSeek=0)
+		ja.getFailures(self.name)
+		jb = self._filter("resumeJailB")
+		jb.addLogPath(self.name, autoSeek=0)
+		jb.getFailures(self.name)
+		self.assertEqual(ja.failManager.getFailTotal(), 1)
+		self.assertEqual(jb.failManager.getFailTotal(), 1)
+		# jail B restarts independently of jail A:
+		jb2 = self._filter("resumeJailB")
+		jb2.addLogPath(self.name, autoSeek=0)
+		jb2.getFailures(self.name)
+		self.assertEqual(jb2.failManager.getFailTotal(), 0)
+
+
 class DNSUtilsTests(unittest.TestCase):
 
 	def testCache(self):

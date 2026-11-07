@@ -125,6 +125,11 @@ class Fail2BanDb(object):
 			"path TEXT, " \
 			"firstlinemd5 TEXT, " \
 			"lastfilepos INTEGER DEFAULT 0, " \
+			"lastfiletime INTEGER DEFAULT 0, " \
+			"lastentryid TEXT, " \
+			"gapstart INTEGER DEFAULT 0, " \
+			"gapend INTEGER DEFAULT 0, " \
+			"gapreported INTEGER DEFAULT 0, " \
 			"FOREIGN KEY(jail) REFERENCES jails(name) ON DELETE CASCADE, " \
 			"UNIQUE(jail, path)," \
 			"UNIQUE(jail, path, firstlinemd5)" \
@@ -251,6 +256,47 @@ class Fail2BanDb(object):
 				if pypy:
 					cur.execute("PRAGMA journal_mode = MEMORY")
 				cur.close()
+		# transparently extend logs table with resume/gap columns
+		# (additive only - no version bump and no data migration):
+		self._ensureLogsSchema()
+
+	# Extra (optional) columns of logs table, added idempotently for
+	# already existing databases (old databases need no migration):
+	_LOGS_EXTRA_COLS = (
+		('lastfiletime', "INTEGER DEFAULT 0"),
+		('lastentryid', "TEXT"),
+		('gapstart', "INTEGER DEFAULT 0"),
+		('gapend', "INTEGER DEFAULT 0"),
+		('gapreported', "INTEGER DEFAULT 0"),
+	)
+
+	def _ensureLogsSchema(self):
+		"""Add checkpoint/gap columns to logs table if missing.
+
+		Purely additive and idempotent; does not bump the database version
+		or move any data. Failure is non-fatal - the file backends simply
+		fall back to the legacy byte position behavior in that case.
+		"""
+		cur = None
+		try:
+			cur = self._db.cursor()
+			cur.execute("PRAGMA table_info(logs)")
+			columns = set(row[1] for row in cur.fetchall())
+			if not columns:
+				# table not created yet - it will be created with all columns
+				return
+			for name, decl in Fail2BanDb._LOGS_EXTRA_COLS:
+				if name not in columns:
+					cur.execute("ALTER TABLE logs ADD COLUMN %s %s" % (name, decl))
+					columns.add(name)
+			self._db.commit()
+		except sqlite3.Error as e:
+			logSys.warning(
+				"Unable to extend logs table with resume columns: %s",
+				e.args[0])
+		finally:
+			if cur is not None:
+				cur.close()
 
 	def close(self):
 		logSys.debug("Close connection to database ...")
@@ -359,7 +405,8 @@ class Fail2BanDb(object):
 							"CREATE TEMPORARY TABLE logs_temp AS SELECT * FROM logs;"
 							"DROP TABLE logs;"
 							"%s;"
-							"INSERT INTO logs SELECT * from logs_temp;"
+							"INSERT INTO logs(jail, path, firstlinemd5, lastfilepos) "
+							"SELECT jail, path, firstlinemd5, lastfilepos from logs_temp;"
 							"DROP TABLE logs_temp;"
 							"UPDATE fail2banDb SET version = 2;"
 							"COMMIT;" % Fail2BanDb._CREATE_TABS['logs'])
@@ -486,6 +533,72 @@ class Fail2BanDb(object):
 		return lastLinePos
 
 	@commitandrollback
+	def getLogResume(self, cur, jail, name):
+		"""Get the last checkpoint of a monitored log file.
+
+		Parameters
+		----------
+		jail : Jail
+			Jail that log is being monitored by.
+		name : str
+			Path of the log file.
+
+		Returns
+		-------
+		dict or None
+			``{'pos': int, 'time': int, 'id': str|None,
+			'gap': (start, end, reported)|None}`` for an already known
+			log; ``None`` otherwise. The checkpoint (time/id) is returned
+			even if the first line hash differs (log rotated or cleared),
+			so the filter can reconcile against the new content and report
+			the gap.
+		"""
+		try:
+			cur.execute(
+				"SELECT lastfilepos, lastfiletime, lastentryid, "
+					"gapstart, gapend, gapreported FROM logs "
+					"WHERE jail=? AND path=?",
+				(jail.name, name))
+			row = cur.fetchone()
+		except sqlite3.Error as e:
+			# resume columns unavailable (e.g. schema extension failed) -
+			# caller simply falls back to legacy behavior:
+			logSys.debug("getLogResume failed for %r: %s", name, e.args[0])
+			return None
+		if row is None:
+			return None
+		pos, entryTime, entryId, gapStart, gapEnd, gapReported = row
+		gap = None
+		if gapStart or gapEnd:
+			gap = (int(gapStart or 0), int(gapEnd or 0), int(gapReported or 0))
+		return {
+			'pos': int(pos or 0),
+			'time': int(entryTime or 0),
+			'id': entryId,
+			'gap': gap,
+		}
+
+	@commitandrollback
+	def updateLogGap(self, cur, jail, name, start, end, reported=1):
+		"""Persist a detected log gap (and its reported flag) immediately.
+
+		Kept separate from the batched position updates, so that a gap is
+		reported at most once even if fail2ban crashes or is restarted
+		before the next position checkpoint gets written.
+		"""
+		cur.execute(
+			"UPDATE logs SET gapstart=?, gapend=?, gapreported=? "
+				"WHERE jail=? AND path=?",
+			(int(start or 0), int(end or 0), 1 if reported else 0,
+				jail.name, name))
+		if not cur.rowcount:
+			cur.execute(
+					"INSERT OR REPLACE INTO logs(jail, path, gapstart, gapend, gapreported) "
+						"VALUES(?, ?, ?, ?, ?)",
+					(jail.name, name, int(start or 0), int(end or 0),
+						1 if reported else 0))
+
+	@commitandrollback
 	def getLogPaths(self, cur, jail=None):
 		"""Gets all the log paths from the database.
 
@@ -511,7 +624,7 @@ class Fail2BanDb(object):
 
 	@commitandrollback
 	def updateLog(self, cur, jail, container):
-		"""Updates hash and last position in log file.
+		"""Updates hash, last position and resume checkpoint in log file.
 
 		Parameters
 		----------
@@ -520,17 +633,33 @@ class Fail2BanDb(object):
 		container : FileContainer
 			File container of the log file being updated.
 		"""
-		self._updateLog(cur, jail, container.getFileName(), container.getPos(), container.getHash())
+		gap = container.getGap()
+		gapStart = gapEnd = gapReported = 0
+		if gap:
+			gapStart, gapEnd, gapReported = gap
+		self._updateLog(cur, jail, container.getFileName(), container.getPos(),
+			container.getHash(),
+			entryTime=container.getEntryTime(), entryId=container.getEntryId(),
+			gapStart=gapStart, gapEnd=gapEnd, gapReported=gapReported)
 
-	def _updateLog(self, cur, jail, name, pos, md5):
+	def _updateLog(self, cur, jail, name, pos, md5, entryTime=0, entryId=None,
+			gapStart=0, gapEnd=0, gapReported=0):
 		cur.execute(
-			"UPDATE logs SET firstlinemd5=?, lastfilepos=? "
-				"WHERE jail=? AND path=?", (md5, pos, jail.name, name))
+			"UPDATE logs SET firstlinemd5=?, lastfilepos=?, lastfiletime=?, "
+				"lastentryid=?, gapstart=?, gapend=?, gapreported=? "
+				"WHERE jail=? AND path=?",
+			(md5, pos, int(entryTime or 0), entryId,
+				int(gapStart or 0), int(gapEnd or 0), int(gapReported or 0),
+				jail.name, name))
 		# be sure it is set (if not available):
 		if not cur.rowcount:
 			cur.execute(
-					"INSERT OR REPLACE INTO logs(jail, path, firstlinemd5, lastfilepos) "
-						"VALUES(?, ?, ?, ?)", (jail.name, name, md5, pos))
+					"INSERT OR REPLACE INTO logs(jail, path, firstlinemd5, lastfilepos, "
+						"lastfiletime, lastentryid, gapstart, gapend, gapreported) "
+						"VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+					(jail.name, name, md5, pos,
+						int(entryTime or 0), entryId,
+						int(gapStart or 0), int(gapEnd or 0), int(gapReported or 0)))
 
 	@commitandrollback
 	def getJournalPos(self, cur, jail, name, time=0, iso=None):

@@ -289,6 +289,62 @@ class DatabaseTest(LogCaptureTestCase):
 			self.db.addLog(self.jail, self.fileContainer), None)
 		os.remove(filename)
 
+	def testLogResumeCheckpoint(self):
+		self.testAddJail() # Jail required
+		_, filename = tempfile.mkstemp(".log", "Fail2BanDb_")
+		try:
+			with open(filename, "w") as f:
+				f.write("first line identifies the file generation\n")
+			fc = FileContainer(filename, "utf-8")
+			# unknown log: nothing to resume:
+			self.assertIsNone(self.db.addLog(self.jail, fc))
+			cp = self.db.getLogResume(self.jail, filename)
+			self.assertEqual(cp['time'], 0)
+			self.assertIsNone(cp['id'])
+			self.assertIsNone(cp['gap'])
+			# checkpoint with entry identity:
+			fc.noteEntry(1500000100, "1500000100 failure from 192.0.2.1")
+			fc.open(); fc.readline(); fc.close()
+			self.db.updateLog(self.jail, fc)
+			cp = self.db.getLogResume(self.jail, filename)
+			self.assertEqual(cp['time'], 1500000100)
+			self.assertTrue(cp['id'].endswith(':1'))
+			# gap reported separately and immediately (once-flag):
+			self.db.updateLogGap(self.jail, filename, 1500000100, 1500000110, 1)
+			cp = self.db.getLogResume(self.jail, filename)
+			self.assertEqual(cp['gap'], (1500000100, 1500000110, 1))
+			# normal checkpoint update beyond gap clears it:
+			fc.noteEntry(1500000111, "1500000111 failure from 192.0.2.2")
+			fc.clearGap()
+			self.db.updateLog(self.jail, fc)
+			cp = self.db.getLogResume(self.jail, filename)
+			self.assertEqual(cp['time'], 1500000111)
+			self.assertIsNone(cp['gap'])
+			# per-file, per-jail isolation:
+			self.assertIsNone(self.db.getLogResume(self.jail, '/other.log'))
+		finally:
+			os.remove(filename)
+
+	def testOldSchemaResumeDefaults(self):
+		# v2 database gets the resume columns transparently (no version
+		# bump / data migration) with legacy defaults:
+		self.db = None
+		_, dbFilename = tempfile.mkstemp(".db", "fail2ban_")
+		shutil.copyfile(
+			os.path.join(TEST_FILES_DIR, 'database_v2.db'), dbFilename)
+		try:
+			self.db = Fail2BanDb(dbFilename)
+			self.assertEqual(self.db.__version__, 4)
+			self.jail = DummyJail(name='pam-generic')
+			cp = self.db.getLogResume(self.jail, '/var/log/auth.log')
+			self.assertEqual(cp['time'], 0)
+			self.assertIsNone(cp['id'])
+			self.assertIsNone(cp['gap'])
+		finally:
+			os.remove(dbFilename)
+			if os.path.exists(self.db._dbBackupFilename):
+				os.remove(self.db._dbBackupFilename)
+
 	def testUpdateJournal(self):
 		self.testAddJail() # Jail required
 		# not yet updated:

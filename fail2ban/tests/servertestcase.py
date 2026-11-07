@@ -631,7 +631,8 @@ class Transmitter(TransmitterBase):
 		('Filter', [
 			('Currently failed', 0),
 			('Total failed', 0),
-			('File list', [])]
+			('File list', []),
+			('File resume', [])]
 		),
 		('Actions', [
 			('Currently banned', 0),
@@ -689,7 +690,8 @@ class Transmitter(TransmitterBase):
 					('Filter', [
 						('Currently failed', 0),
 						('Total failed', 0),
-						('File list', [])]
+						('File list', []),
+					('File resume', [])]
 					),
 					('Actions', [
 						('Currently banned', 0),

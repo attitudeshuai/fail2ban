@@ -464,6 +464,7 @@ def gatherTests(regexps=None, opts=None):
 	# each test case class self will check no network, and skip it (we see it in log)
 	tests.addTest(loadTests(filtertestcase.IgnoreIPDNS))
 	tests.addTest(loadTests(filtertestcase.GetFailures))
+	tests.addTest(loadTests(filtertestcase.LogFileResume))
 	tests.addTest(loadTests(filtertestcase.DNSUtilsTests))
 	tests.addTest(loadTests(filtertestcase.DNSUtilsNetworkTests))
 	tests.addTest(loadTests(filtertestcase.JailTests))
